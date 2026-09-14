@@ -178,7 +178,7 @@ struct TabBadge {
 enum Rule {
     Plain,
     Progress { percent: u8, color: Color },
-    Shimmer { color: Color },
+    Shimmer { phase: f32, color: Color },
     Breathe { color: Color },
 }
 
@@ -506,6 +506,7 @@ impl Session {
         let background = win.active_tab().id != id;
         let tab = win.find_tab_mut(id)?;
         tab.engine.advance_bytes(bytes);
+        tab.note_output(bytes.len(), Instant::now());
         let (mut changed, notice) = tab.refresh_identity(osc_titles);
         let rang = tab.take_bell();
         if background && tab.agent.is_none() {
@@ -580,7 +581,6 @@ impl Session {
         self.force_redraw = true;
     }
 
-    /// Reveals the coming frames gradually, for a client that just attached.
     pub fn materialize(&mut self) {
         if self.config.attach_transition {
             self.transitions.materialize();
@@ -1366,7 +1366,6 @@ impl Session {
         }
     }
 
-    /// Runs `$EDITOR` (falling back to `vim`) on the config file in a new tab.
     fn open_config(&mut self) {
         let editor = std::env::var("EDITOR").unwrap_or_default();
         let mut argv: Vec<&str> = editor.split_whitespace().collect();
@@ -1585,8 +1584,6 @@ impl Session {
         self.set_maximized((self.maximized != Some(id)).then_some(id));
     }
 
-    /// Maximizes `target`, or restores the layout for `None`, animating
-    /// the window's rectangle between the two.
     fn set_maximized(&mut self, target: Option<WindowId>) {
         if target == self.maximized {
             return;
@@ -1627,7 +1624,6 @@ impl Session {
         self.force_redraw = true;
     }
 
-    /// The window as drawn this frame: content, tab bar, and shade.
     fn snapshot_window(&self, id: WindowId) -> Option<Buffer> {
         let win = self.windows.get(&id)?;
         let mut buf = Buffer::empty(win.rect);
@@ -1772,7 +1768,6 @@ impl Session {
         self.collapse_window(win_id, snapshot)
     }
 
-    /// The window's last frame, for sliding out of the layout.
     fn departure_snapshot(&self, id: WindowId) -> Option<Buffer> {
         self.config
             .layout_transitions
@@ -1962,6 +1957,7 @@ impl Session {
                 tracker.mark_seen();
             }
             let progress = win.active_tab().progress();
+            let phase = win.active_tab_mut().advance_shimmer(now);
             let active = win.active;
             let bar = win.tab_bar_rect();
             // Room for the controls past the two-cell rule lead-in.
@@ -2035,6 +2031,7 @@ impl Session {
                     color: palette.status(status.map_or(agent::Status::Working, |(s, _)| s)),
                 },
                 (None, Some((status, Anim::Shimmer))) => Rule::Shimmer {
+                    phase,
                     color: palette.status(status),
                 },
                 (None, Some((status, Anim::Breathe))) => Rule::Breathe {
@@ -2247,8 +2244,8 @@ impl Session {
         if self.prompt.is_some() {
             return;
         }
-        // A window still sliding or zooming into place, or a frame still
-        // materializing, has no settled cursor cell.
+        // The cursor has no settled cell while the focused window is still
+        // moving or the frame is still materializing.
         if self.transitions.materializing()
             || self.transitions.live(self.focus).is_some()
             || self
@@ -2346,7 +2343,6 @@ fn truncate_name(name: &str, width: usize) -> String {
     out
 }
 
-/// A window's active tab and, in scroll mode, its scrollbar.
 fn render_window(win: &Window, palette: &Palette, buf: &mut Buffer) {
     let tab = win.active_tab();
     render_tab(tab, buf);
@@ -2404,8 +2400,8 @@ fn render_tab_bar(
                     (glyph, plain)
                 }
             }
-            Rule::Shimmer { color } => {
-                (glyph, anim::shimmer(color, i, bar.width as usize, elapsed))
+            Rule::Shimmer { phase, color } => {
+                (glyph, anim::shimmer_at(color, i, bar.width as usize, phase))
             }
             Rule::Breathe { color } => (glyph, anim::breathe(color, elapsed)),
         };

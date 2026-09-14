@@ -198,9 +198,7 @@ pub fn run() -> i32 {
 }
 
 const SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
-/// Between frames of a running animation.
 const TICK: std::time::Duration = std::time::Duration::from_millis(60);
-/// Between frames of a running transition.
 const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Truncating to whole seconds lands the wake just past the minute
@@ -285,10 +283,9 @@ impl Server {
         self.sessions.values().any(|s| s.has_pending_idle())
     }
 
-    /// Whether a session some client is looking at satisfies `pred`. The
-    /// switcher, grid, and blank auto screen show every session.
     fn any_shown(&self, pred: impl Fn(&Session) -> bool) -> bool {
         self.clients.values().any(|c| {
+            // The switcher, grid, and blank auto screen show every session.
             if c.switcher.is_some()
                 || c.grid.is_some()
                 || c.auto.is_some_and(|a| a.presented.is_none())

@@ -20,7 +20,7 @@ pub fn elapsed() -> Duration {
 }
 
 /// Seconds per sweep or breath.
-const PERIOD: f32 = 2.0;
+pub const PERIOD: f32 = 2.0;
 const BAND_HALF_WIDTH: f32 = 5.0;
 /// Cells beyond each edge, so the band slides fully off instead of
 /// snapping back.

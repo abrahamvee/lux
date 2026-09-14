@@ -171,7 +171,6 @@ pub fn remove_leaf(node: Node, target: WindowId) -> Option<Node> {
     }
 }
 
-/// The split directly above `id`'s leaf, and which side the leaf is on.
 pub fn parent_split(node: &Node, id: WindowId) -> Option<(SplitKind, Side)> {
     let Node::Split(s) = node else { return None };
     if matches!(*s.first, Node::Leaf(leaf) if leaf == id) {

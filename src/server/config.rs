@@ -16,7 +16,6 @@ pub enum OscTitles {
     All,
 }
 
-/// The glyph a window's tab bar rule is drawn with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum RuleStyle {
     #[default]
@@ -52,7 +51,7 @@ pub struct Config {
     pub shadows: bool,
     /// Animate splits, window removal, and maximize.
     pub layout_transitions: bool,
-    /// Materialize the first frame after a client attaches.
+    /// Reveal the first frame cell by cell after a client attaches.
     pub attach_transition: bool,
 }
 

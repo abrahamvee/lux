@@ -4,8 +4,8 @@
 
 - Configuration `rule-style` draws the tab bar rule as a dash (default) or
   a braille dot line.
-- The tab bar rule's working shimmer runs at the status text's pace rather
-  than the tab's output rate.
+- The tab bar rule's working shimmer sweeps at the tab's output rate, capped
+  at the status text's pace, and holds still while the tab is quiet.
 - `:config-open` edits the config file in a new `$EDITOR` tab (vim fallback),
   and `:config-reload` applies it to every running session.
 - Updated dependencies.

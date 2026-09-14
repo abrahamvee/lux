@@ -1,10 +1,12 @@
 //! Windows and the tabs they own: each tab is one PTY plus a terminal engine.
 
+use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -18,6 +20,7 @@ use wezterm_term::{
 
 use crate::server::ServerEvent;
 use crate::server::agent::{self, AgentKind, AgentState, Tracker};
+use crate::server::anim;
 use crate::server::config::OscTitles;
 use crate::server::layout::WindowId;
 
@@ -91,6 +94,61 @@ pub enum LastOutput {
     Text(String),
     NoneCompleted,
     NoBoundaries,
+}
+
+const RATE_WINDOW: Duration = Duration::from_secs(1);
+/// Bytes per second at which the rule's shimmer reaches the status text's
+/// pace.
+const FULL_SPEED_RATE: f32 = 8192.0;
+
+/// Recent writes, whose volume paces the rule's shimmer sweep.
+struct RecentOutput {
+    writes: VecDeque<Write>,
+    phase: f32,
+    advanced: Instant,
+}
+
+struct Write {
+    at: Instant,
+    len: usize,
+}
+
+impl RecentOutput {
+    fn new(now: Instant) -> Self {
+        Self {
+            writes: VecDeque::new(),
+            phase: 0.0,
+            advanced: now,
+        }
+    }
+
+    fn record(&mut self, now: Instant, len: usize) {
+        self.prune(now);
+        self.writes.push_back(Write { at: now, len });
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .writes
+            .front()
+            .is_some_and(|w| now.duration_since(w.at) > RATE_WINDOW)
+        {
+            self.writes.pop_front();
+        }
+    }
+
+    /// Moves the sweep on by the time elapsed at the current output rate,
+    /// so it stands still without output.
+    fn advance(&mut self, now: Instant) -> f32 {
+        self.prune(now);
+        let bytes: usize = self.writes.iter().map(|w| w.len).sum();
+        let rate = bytes as f32 / RATE_WINDOW.as_secs_f32();
+        let sweeps_per_sec = (rate / FULL_SPEED_RATE).min(1.0) / anim::PERIOD;
+        let dt = now.duration_since(self.advanced).as_secs_f32();
+        self.phase = (self.phase + sweeps_per_sec * dt).rem_euclid(1.0);
+        self.advanced = now;
+        self.phase
+    }
 }
 
 /// A tab's agent reaching done or blocked, for the server to raise a
@@ -269,6 +327,7 @@ pub struct Tab {
     bell: Arc<AtomicBool>,
     /// Set while the tab is off screen, cleared once it is looked at.
     pub activity: Option<Activity>,
+    output: RecentOutput,
     master: Box<dyn MasterPty>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -378,9 +437,19 @@ impl Tab {
             osc_title,
             bell,
             activity: None,
+            output: RecentOutput::new(Instant::now()),
             master: pair.master,
             child,
         })
+    }
+
+    pub fn note_output(&mut self, len: usize, now: Instant) {
+        self.output.record(now, len);
+    }
+
+    /// The rule shimmer's phase, moved on by recent output.
+    pub fn advance_shimmer(&mut self, now: Instant) -> f32 {
+        self.output.advance(now)
     }
 
     pub fn take_bell(&mut self) -> bool {
@@ -946,6 +1015,26 @@ mod tests {
         assert!(!bell.load(Ordering::Relaxed));
         engine.advance_bytes(b"\x07");
         assert!(bell.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn shimmer_speed_follows_output_and_stops_without_it() {
+        let start = Instant::now();
+        let mut output = RecentOutput::new(start);
+        assert_eq!(output.advance(start + Duration::from_millis(500)), 0.0);
+        // Full speed sweeps at the status text's pace: 8 KiB within the
+        // window moves half a sweep per second.
+        output.record(start + Duration::from_millis(500), 8192);
+        let phase = output.advance(start + Duration::from_millis(1500));
+        assert!((phase - 0.5).abs() < 0.01, "phase {phase}");
+        // Half the rate moves half as far.
+        let mut output = RecentOutput::new(start);
+        output.record(start, 4096);
+        let phase = output.advance(start + Duration::from_millis(1000));
+        assert!((phase - 0.25).abs() < 0.01, "phase {phase}");
+        // Once the write ages out the sweep stands still.
+        let held = output.advance(start + Duration::from_millis(3000));
+        assert_eq!(held, phase);
     }
 
     #[test]

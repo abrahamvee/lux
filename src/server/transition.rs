@@ -1,5 +1,5 @@
-//! One-shot transitions: bounded effects that run once over the rendered
-//! frame and remove themselves when done.
+//! One-shot effects drawn over the rendered frame and dropped when they
+//! finish.
 
 use std::time::{Duration, Instant};
 
@@ -17,9 +17,8 @@ const SLIDE_OUT: (u32, Interpolation) = (200, Interpolation::QuadIn);
 const ZOOM: (u32, Interpolation) = (200, Interpolation::QuadOut);
 const MATERIALIZE: (u32, Interpolation) = (400, Interpolation::QuadOut);
 
-/// A buffer a transition draws a window from: rendered afresh each frame
-/// while the window slides in or grows, captured once when it leaves or
-/// shrinks.
+/// A buffer a transition draws a window from: live for a window entering
+/// or growing, a snapshot for one leaving or shrinking.
 pub type Frame = RefCount<Buffer>;
 
 pub struct Slide {
@@ -33,13 +32,11 @@ pub struct Zoom {
     from: Rect,
     to: Rect,
     frame: Frame,
-    /// The frame is re-rendered every frame rather than a snapshot.
     pub live: bool,
     effect: Effect,
 }
 
 impl Zoom {
-    /// The window's rectangle at this point of the transition.
     pub fn rect(&self) -> Rect {
         let alpha = self.effect.timer().map_or(1.0, |t| t.alpha());
         lerp(self.from, self.to, alpha)
@@ -65,7 +62,6 @@ impl Transitions {
             || self.materialize.is_some()
     }
 
-    /// Advances every effect by the time since the last frame.
     pub fn tick(&mut self, now: Instant) {
         let delta = self
             .last
@@ -78,8 +74,6 @@ impl Transitions {
         }
     }
 
-    /// Drops finished effects after their last frame, returning whether any
-    /// ended.
     pub fn prune(&mut self) -> bool {
         let before = self.count();
         self.dims.retain(|(_, e)| !e.done());
@@ -115,15 +109,14 @@ impl Transitions {
             .chain(self.materialize.iter_mut())
     }
 
-    /// The clock only runs while something is in flight, so a transition
-    /// never starts with a stale delta.
+    /// The clock stops between transitions, so a new one never starts with
+    /// a stale delta.
     fn start(&mut self) {
         if !self.running() {
             self.last = Some(Instant::now());
         }
     }
 
-    /// Fades `window` from full brightness to the dimmed shade.
     pub fn dim(&mut self, window: WindowId, palette: Palette, colors: TermColors) {
         self.start();
         self.undim(window);
@@ -145,8 +138,7 @@ impl Transitions {
             .map(|(_, e)| e)
     }
 
-    /// Slides `window`, the second half of a fresh split, in from the far
-    /// edge.
+    /// A new split's second half enters from the far edge.
     pub fn slide_in(&mut self, window: WindowId, kind: SplitKind) {
         self.start();
         self.slides.retain(|s| s.window != window);
@@ -159,17 +151,12 @@ impl Transitions {
         });
     }
 
-    /// Slides a removed window's last frame out of its rectangle, away
-    /// from the sibling that takes its space.
     pub fn slide_out(&mut self, snapshot: Buffer, kind: SplitKind, side: Side) {
         self.start();
         let effect = slide(ref_count(snapshot), kind, side, false, timer(SLIDE_OUT));
         self.departures.push(effect);
     }
 
-    /// Animates `window`'s rectangle from `from` to `to`. With a snapshot
-    /// the window shrinks showing its last frame; without one it grows
-    /// showing its live content rendered at `to`.
     pub fn zoom(&mut self, window: WindowId, from: Rect, to: Rect, snapshot: Option<Buffer>) {
         self.start();
         let live = snapshot.is_none();
@@ -203,8 +190,8 @@ impl Transitions {
         self.zoom.as_ref()
     }
 
-    /// The buffer `window` renders into this frame instead of the screen,
-    /// while a transition draws it from there.
+    /// The buffer `window` renders into instead of the screen while a
+    /// transition draws it from there.
     pub fn live(&self, window: WindowId) -> Option<Frame> {
         if let Some(zoom) = &self.zoom
             && zoom.window == window
@@ -218,7 +205,6 @@ impl Transitions {
             .map(|s| s.frame.clone())
     }
 
-    /// Drops everything pinned to a window that no longer exists.
     pub fn forget(&mut self, window: WindowId) {
         self.undim(window);
         self.slides.retain(|s| s.window != window);
@@ -227,7 +213,6 @@ impl Transitions {
         }
     }
 
-    /// Draws every departing, sliding, and zooming window over the frame.
     pub fn overlay(&mut self, buf: &mut Buffer) {
         let area = buf.area;
         for effect in &mut self.departures {
@@ -241,7 +226,6 @@ impl Transitions {
         }
     }
 
-    /// Reveals the next frames cell by cell, from blank to fully drawn.
     pub fn materialize(&mut self) {
         self.start();
         self.materialize = Some(fx::coalesce_from(Style::reset(), timer(MATERIALIZE)));
@@ -251,8 +235,7 @@ impl Transitions {
         self.materialize.is_some()
     }
 
-    /// Blanks the cells that haven't materialized yet. Runs over the
-    /// finished frame, chrome included, so it comes after everything else.
+    /// Runs last, over the finished frame, chrome included.
     pub fn reveal(&mut self, buf: &mut Buffer) {
         if let Some(effect) = &mut self.materialize {
             let area = buf.area;
@@ -265,8 +248,6 @@ fn timer((ms, interpolation): (u32, Interpolation)) -> EffectTimer {
     EffectTimer::from_ms(ms, interpolation)
 }
 
-/// Draws `frame` shifted along the split axis: fully off its rectangle
-/// toward `side`'s edge at one end of the timer, in place at the other.
 fn slide(frame: Frame, kind: SplitKind, side: Side, entering: bool, timer: EffectTimer) -> Effect {
     fx::effect_fn_buf((), timer, move |_, ctx, buf| {
         let frame = frame.borrow();
@@ -288,8 +269,6 @@ fn slide(frame: Frame, kind: SplitKind, side: Side, entering: bool, timer: Effec
     })
 }
 
-/// Copies `src` into `buf` shifted by (`dx`, `dy`), keeping only what lands
-/// inside `within`.
 fn blit(src: &Buffer, buf: &mut Buffer, within: Rect, dx: i32, dy: i32) {
     for pos in src.area.positions() {
         let (x, y) = (i32::from(pos.x) + dx, i32::from(pos.y) + dy);
