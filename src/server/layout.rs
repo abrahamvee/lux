@@ -171,17 +171,6 @@ pub fn remove_leaf(node: Node, target: WindowId) -> Option<Node> {
     }
 }
 
-pub fn parent_split(node: &Node, id: WindowId) -> Option<(SplitKind, Side)> {
-    let Node::Split(s) = node else { return None };
-    if matches!(*s.first, Node::Leaf(leaf) if leaf == id) {
-        return Some((s.kind, Side::First));
-    }
-    if matches!(*s.second, Node::Leaf(leaf) if leaf == id) {
-        return Some((s.kind, Side::Second));
-    }
-    parent_split(&s.first, id).or_else(|| parent_split(&s.second, id))
-}
-
 /// Nudge the boundary on `focused`'s `dir` side by one cell. Returns false
 /// when no split has a sibling on that side.
 pub fn resize_toward(node: &mut Node, area: Rect, focused: WindowId, dir: Dir) -> bool {
@@ -462,27 +451,6 @@ mod tests {
         let tree = remove_leaf(tree, 1).unwrap();
         assert_eq!(leaves(&tree), vec![3]);
         assert!(remove_leaf(tree, 3).is_none());
-    }
-
-    #[test]
-    fn parent_split_names_the_leafs_split_and_side() {
-        let mut tree = Node::Leaf(1);
-        assert_eq!(parent_split(&tree, 1), None);
-        split_leaf(&mut tree, 1, SplitKind::SideBySide, 2);
-        split_leaf(&mut tree, 2, SplitKind::Stacked, 3);
-        assert_eq!(
-            parent_split(&tree, 1),
-            Some((SplitKind::SideBySide, Side::First))
-        );
-        assert_eq!(
-            parent_split(&tree, 2),
-            Some((SplitKind::Stacked, Side::First))
-        );
-        assert_eq!(
-            parent_split(&tree, 3),
-            Some((SplitKind::Stacked, Side::Second))
-        );
-        assert_eq!(parent_split(&tree, 4), None);
     }
 
     #[test]

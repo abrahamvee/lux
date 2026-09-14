@@ -191,6 +191,18 @@ static CLAUDE_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
                 ..Default::default()
             },
         },
+        // A fatal API error's transcript line. The auto-retry banner reads
+        // "API error" too, so its countdown rules it out.
+        Rule {
+            state: AgentState::Blocked,
+            priority: 870,
+            source: Source::Screen,
+            gate: Gate {
+                regex: vec![Regex::new("API Error").expect("valid rule regex")],
+                not: vec![contains(&["retrying in"])],
+                ..Default::default()
+            },
+        },
         // The title spinner: Braille frames on older versions, half-circle
         // frames from 2.1.228 on.
         Rule {
@@ -817,6 +829,47 @@ mod tests {
         let s = snap(
             "MCP server “my-server” requests your input\n\nEsc to cancel\n",
             "✳ Claude Code",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+    }
+
+    #[test]
+    fn api_error_is_blocked() {
+        let s = snap(
+            "⏺ API Error: 401 Invalid API key · Please run /login\n\n\
+             ────────────\n❯\n────────────\n  ~/src/lux ⎇ main\n",
+            "✳ Claude Code",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Blocked);
+        let s = snap(
+            "⏺ API Error: Request was aborted.\n\n✻ Thinking… (esc to interrupt)\n",
+            "◐ claude",
+            "indeterminate",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Blocked);
+        let s = snap("● The api error was transient.\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+        let s = snap(
+            "────────────\n❯ why did I get API Error: 401?\n────────────\n  ~/src/lux ⎇ main\n",
+            "",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+    }
+
+    #[test]
+    fn api_error_retry_countdown_is_not_blocked() {
+        let s = snap(
+            "✗ API error · Retrying in 4s · attempt 2/10\n",
+            "◐ claude",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+        let s = snap(
+            "⎿  API Error (529 overloaded) · Retrying in 1 seconds… (attempt 1/10)\n",
+            "",
             "none",
         );
         assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);

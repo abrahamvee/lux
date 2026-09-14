@@ -8,24 +8,16 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use tachyonfx::{Effect, EffectTimer, Interpolation, RefCount, fx, ref_count};
 
-use crate::server::layout::{Side, SplitKind, WindowId};
+use crate::server::layout::WindowId;
 use crate::server::palette::{self, Palette, TermColors};
 
 const DIM_FADE: (u32, Interpolation) = (300, Interpolation::QuadOut);
-const SLIDE_IN: (u32, Interpolation) = (200, Interpolation::QuadOut);
-const SLIDE_OUT: (u32, Interpolation) = (200, Interpolation::QuadIn);
 const ZOOM: (u32, Interpolation) = (200, Interpolation::QuadOut);
 const MATERIALIZE: (u32, Interpolation) = (400, Interpolation::QuadOut);
 
-/// A buffer a transition draws a window from: live for a window entering
-/// or growing, a snapshot for one leaving or shrinking.
+/// A buffer a transition draws a window from: live for a window growing,
+/// a snapshot for one shrinking.
 pub type Frame = RefCount<Buffer>;
-
-pub struct Slide {
-    pub window: WindowId,
-    pub frame: Frame,
-    effect: Effect,
-}
 
 pub struct Zoom {
     pub window: WindowId,
@@ -46,8 +38,6 @@ impl Zoom {
 #[derive(Default)]
 pub struct Transitions {
     dims: Vec<(WindowId, Effect)>,
-    slides: Vec<Slide>,
-    departures: Vec<Effect>,
     zoom: Option<Zoom>,
     materialize: Option<Effect>,
     last: Option<Instant>,
@@ -55,11 +45,7 @@ pub struct Transitions {
 
 impl Transitions {
     pub fn running(&self) -> bool {
-        !self.dims.is_empty()
-            || !self.slides.is_empty()
-            || !self.departures.is_empty()
-            || self.zoom.is_some()
-            || self.materialize.is_some()
+        !self.dims.is_empty() || self.zoom.is_some() || self.materialize.is_some()
     }
 
     pub fn tick(&mut self, now: Instant) {
@@ -77,8 +63,6 @@ impl Transitions {
     pub fn prune(&mut self) -> bool {
         let before = self.count();
         self.dims.retain(|(_, e)| !e.done());
-        self.slides.retain(|s| !s.effect.done());
-        self.departures.retain(|e| !e.done());
         if self.zoom.as_ref().is_some_and(|z| z.effect.done()) {
             self.zoom = None;
         }
@@ -92,19 +76,13 @@ impl Transitions {
     }
 
     fn count(&self) -> usize {
-        self.dims.len()
-            + self.slides.len()
-            + self.departures.len()
-            + self.zoom.iter().count()
-            + self.materialize.iter().count()
+        self.dims.len() + self.zoom.iter().count() + self.materialize.iter().count()
     }
 
     fn effects_mut(&mut self) -> impl Iterator<Item = &mut Effect> {
         self.dims
             .iter_mut()
             .map(|(_, e)| e)
-            .chain(self.slides.iter_mut().map(|s| &mut s.effect))
-            .chain(self.departures.iter_mut())
             .chain(self.zoom.iter_mut().map(|z| &mut z.effect))
             .chain(self.materialize.iter_mut())
     }
@@ -136,25 +114,6 @@ impl Transitions {
             .iter_mut()
             .find(|(id, _)| *id == window)
             .map(|(_, e)| e)
-    }
-
-    /// A new split's second half enters from the far edge.
-    pub fn slide_in(&mut self, window: WindowId, kind: SplitKind) {
-        self.start();
-        self.slides.retain(|s| s.window != window);
-        let frame = ref_count(Buffer::empty(Rect::default()));
-        let effect = slide(frame.clone(), kind, Side::Second, true, timer(SLIDE_IN));
-        self.slides.push(Slide {
-            window,
-            frame,
-            effect,
-        });
-    }
-
-    pub fn slide_out(&mut self, snapshot: Buffer, kind: SplitKind, side: Side) {
-        self.start();
-        let effect = slide(ref_count(snapshot), kind, side, false, timer(SLIDE_OUT));
-        self.departures.push(effect);
     }
 
     pub fn zoom(&mut self, window: WindowId, from: Rect, to: Rect, snapshot: Option<Buffer>) {
@@ -193,35 +152,22 @@ impl Transitions {
     /// The buffer `window` renders into instead of the screen while a
     /// transition draws it from there.
     pub fn live(&self, window: WindowId) -> Option<Frame> {
-        if let Some(zoom) = &self.zoom
-            && zoom.window == window
-            && zoom.live
-        {
-            return Some(zoom.frame.clone());
-        }
-        self.slides
-            .iter()
-            .find(|s| s.window == window)
-            .map(|s| s.frame.clone())
+        self.zoom
+            .as_ref()
+            .filter(|z| z.window == window && z.live)
+            .map(|z| z.frame.clone())
     }
 
     pub fn forget(&mut self, window: WindowId) {
         self.undim(window);
-        self.slides.retain(|s| s.window != window);
         if self.zoom.as_ref().is_some_and(|z| z.window == window) {
             self.zoom = None;
         }
     }
 
     pub fn overlay(&mut self, buf: &mut Buffer) {
-        let area = buf.area;
-        for effect in &mut self.departures {
-            effect.process(Duration::ZERO, buf, area);
-        }
-        for slide in &mut self.slides {
-            slide.effect.process(Duration::ZERO, buf, area);
-        }
         if let Some(zoom) = &mut self.zoom {
+            let area = buf.area;
             zoom.effect.process(Duration::ZERO, buf, area);
         }
     }
@@ -246,27 +192,6 @@ impl Transitions {
 
 fn timer((ms, interpolation): (u32, Interpolation)) -> EffectTimer {
     EffectTimer::from_ms(ms, interpolation)
-}
-
-fn slide(frame: Frame, kind: SplitKind, side: Side, entering: bool, timer: EffectTimer) -> Effect {
-    fx::effect_fn_buf((), timer, move |_, ctx, buf| {
-        let frame = frame.borrow();
-        let rect = frame.area;
-        let out = if entering {
-            1.0 - ctx.alpha()
-        } else {
-            ctx.alpha()
-        };
-        let sign = match side {
-            Side::First => -1.0,
-            Side::Second => 1.0,
-        };
-        let (dx, dy) = match kind {
-            SplitKind::SideBySide => ((f32::from(rect.width) * out * sign).round() as i32, 0),
-            SplitKind::Stacked => (0, (f32::from(rect.height) * out * sign).round() as i32),
-        };
-        blit(&frame, buf, rect, dx, dy);
-    })
 }
 
 fn blit(src: &Buffer, buf: &mut Buffer, within: Rect, dx: i32, dy: i32) {
@@ -317,49 +242,6 @@ mod tests {
     fn advance(t: &mut Transitions, ms: u64) {
         let last = t.last.expect("running");
         t.tick(last + Duration::from_millis(ms));
-    }
-
-    #[test]
-    fn a_new_split_window_slides_in_from_the_far_edge() {
-        let screen = Rect::new(0, 0, 8, 1);
-        let mut t = Transitions::default();
-        t.slide_in(1, SplitKind::SideBySide);
-        let rect = Rect::new(4, 0, 4, 1);
-        *t.live(1).unwrap().borrow_mut() = filled(rect, 'x');
-        let mut buf = Buffer::empty(screen);
-        t.overlay(&mut buf);
-        assert_eq!(row(&buf, 0), "        ", "starts fully off the right edge");
-        advance(&mut t, 100);
-        let mut buf = Buffer::empty(screen);
-        t.overlay(&mut buf);
-        assert_eq!(row(&buf, 0), "     xxx", "never spills left of its rect");
-        advance(&mut t, 200);
-        let mut buf = Buffer::empty(screen);
-        t.overlay(&mut buf);
-        assert_eq!(row(&buf, 0), "    xxxx");
-        assert!(t.prune());
-        assert!(!t.running());
-    }
-
-    #[test]
-    fn a_removed_window_slides_out_away_from_its_sibling() {
-        let screen = Rect::new(0, 0, 4, 4);
-        let mut t = Transitions::default();
-        t.slide_out(
-            filled(Rect::new(0, 0, 4, 2), 'a'),
-            SplitKind::Stacked,
-            Side::First,
-        );
-        advance(&mut t, 100);
-        let mut buf = filled(screen, '.');
-        t.overlay(&mut buf);
-        assert_eq!(row(&buf, 0), "aaaa", "top half exits upward");
-        assert_eq!(row(&buf, 1), "....");
-        assert_eq!(row(&buf, 2), "....", "never spills onto the sibling");
-        advance(&mut t, 200);
-        let mut buf = filled(screen, '.');
-        t.overlay(&mut buf);
-        assert!((0..4).all(|y| row(&buf, y) == "...."));
     }
 
     #[test]
@@ -459,15 +341,9 @@ mod tests {
     fn forgetting_a_window_drops_everything_pinned_to_it() {
         let mut t = Transitions::default();
         t.dim(1, Palette::DEFAULT, TermColors::default());
-        t.slide_in(1, SplitKind::Stacked);
         t.zoom(1, Rect::new(0, 0, 1, 1), Rect::new(0, 0, 2, 2), None);
-        t.slide_out(
-            Buffer::empty(Rect::new(0, 0, 1, 1)),
-            SplitKind::Stacked,
-            Side::Second,
-        );
         t.forget(1);
         assert!(t.dim_mut(1).is_none() && t.live(1).is_none() && t.zoom_state().is_none());
-        assert!(t.running(), "a departure belongs to no window");
+        assert!(!t.running());
     }
 }

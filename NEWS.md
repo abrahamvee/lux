@@ -1,5 +1,10 @@
 # News
 
+## 2026-09-13
+
+- A Claude tab that stops on an API error now appears blocked.
+- Splits and closes no longer slide.
+
 ## 2026-09-03
 
 - Configuration `rule-style` draws the tab bar rule as a dash (default) or

@@ -1351,9 +1351,6 @@ impl Session {
         self.next_window_id += 1;
         self.windows.insert(id, win);
         layout::split_leaf(&mut self.tree, self.focus, kind, id);
-        if self.config.layout_transitions {
-            self.transitions.slide_in(id, kind);
-        }
         self.set_focus(id);
         self.force_redraw = true;
     }
@@ -1762,21 +1759,13 @@ impl Session {
             self.force_redraw = true;
             return None;
         }
-        let snapshot = self.departure_snapshot(win_id);
         let mut win = self.windows.remove(&win_id).expect("window exists");
         win.tabs.pop().expect("last tab exists").wait();
-        self.collapse_window(win_id, snapshot)
-    }
-
-    fn departure_snapshot(&self, id: WindowId) -> Option<Buffer> {
-        self.config
-            .layout_transitions
-            .then(|| self.snapshot_window(id))
-            .flatten()
+        self.collapse_window(win_id)
     }
 
     /// The window must already be out of `windows`.
-    fn collapse_window(&mut self, win_id: WindowId, snapshot: Option<Buffer>) -> Option<Effect> {
+    fn collapse_window(&mut self, win_id: WindowId) -> Option<Effect> {
         self.transitions.forget(win_id);
         if self.windows.is_empty() {
             return Some(Effect::Ended);
@@ -1806,11 +1795,6 @@ impl Session {
             let pos = ids.iter().position(|i| *i == win_id).unwrap_or(0);
             self.set_focus(ids[(pos + 1) % ids.len()]);
         }
-        if let (Some(snapshot), Some((kind, side))) =
-            (snapshot, layout::parent_split(&self.tree, win_id))
-        {
-            self.transitions.slide_out(snapshot, kind, side);
-        }
         let tree = std::mem::replace(&mut self.tree, Node::Leaf(self.focus));
         if let Some(tree) = layout::remove_leaf(tree, win_id) {
             self.tree = tree;
@@ -1835,10 +1819,9 @@ impl Session {
             self.force_redraw = true;
             return Some((tab, false));
         }
-        let snapshot = self.departure_snapshot(win_id);
         let mut win = self.windows.remove(&win_id).expect("window exists");
         let tab = win.tabs.pop().expect("last tab exists");
-        let ended = matches!(self.collapse_window(win_id, snapshot), Some(Effect::Ended));
+        let ended = matches!(self.collapse_window(win_id), Some(Effect::Ended));
         self.force_redraw = true;
         Some((tab, ended))
     }

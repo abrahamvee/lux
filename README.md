@@ -163,7 +163,7 @@ rule-style = "dots"      # draw tab bar rules as braille dots
 palette = "default"      # the interface color set
 dim-unfocused = false    # leave unfocused windows at full brightness
 shadows = true           # popovers cast a shadow on the content beneath
-layout-transitions = false  # snap splits, closes, and maximize into place
+layout-transitions = false  # snap maximize into place
 attach-transition = false   # draw the first frame after attaching at once
 ```
 
@@ -191,10 +191,9 @@ asks your terminal for its default and ANSI colors when you attach, so a
 dimmed cell keeps its hue; a terminal that doesn't answer is darkened from
 the palette's stand-ins (light grey on black) instead.
 
-`layout-transitions` is on by default: a new split slides into place, a
-closed window slides out as its sibling takes the space, and maximizing
-animates the window between its place in the layout and the full area.
-Set it to `false` to snap instead.
+`layout-transitions` is on by default: maximizing animates the window
+between its place in the layout and the full area. Set it to `false` to
+snap instead.
 
 `attach-transition` is on by default: the first frame after attaching
 materializes cell by cell rather than appearing whole. Set it to `false`
