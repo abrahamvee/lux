@@ -1,5 +1,10 @@
 # News
 
+## 2026-09-17
+
+- Prefix+`/` (or `/` in scroll mode) searches a tab's scrollback for plain
+  text, highlighting every match and stepping through them with `n`/`N`.
+
 ## 2026-09-13
 
 - A Claude tab that stops on an API error now appears blocked.

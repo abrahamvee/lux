@@ -13,6 +13,7 @@ pub mod keys;
 pub mod layout;
 pub mod palette;
 pub mod persist;
+pub mod search;
 pub mod session;
 pub mod term;
 pub mod transition;

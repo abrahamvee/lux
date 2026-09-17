@@ -23,6 +23,7 @@ use crate::server::agent::{self, AgentKind, AgentState, Tracker};
 use crate::server::anim;
 use crate::server::config::OscTitles;
 use crate::server::layout::WindowId;
+use crate::server::search;
 
 pub type TabId = usize;
 
@@ -312,6 +313,9 @@ pub struct Tab {
     /// Top line of the view in scroll mode, as a stable row index so it
     /// survives scrollback trimming. `None` follows live output.
     scroll_top: Option<isize>,
+    /// The last submitted search's matches, oldest first; cleared on
+    /// leaving scroll mode.
+    search: Option<Vec<search::Match>>,
     pub agent: Option<Tracker>,
     /// Seeded on a resume spawn, refreshed at save time, cleared when
     /// claude exits.
@@ -430,6 +434,7 @@ impl Tab {
             rect,
             drawn_seqno: 0,
             scroll_top: None,
+            search: None,
             agent: None,
             claude_session: None,
             running_claude: false,
@@ -666,6 +671,65 @@ impl Tab {
 
     pub fn exit_scroll_mode(&mut self) {
         self.scroll_top = None;
+        self.search = None;
+    }
+
+    pub fn search(&self) -> Option<&[search::Match]> {
+        self.search.as_deref()
+    }
+
+    /// Find `query` throughout history, then jump to the nearest match
+    /// above the view.
+    pub fn search_for(&mut self, query: String) {
+        let screen = self.engine.screen();
+        let all = 0..screen.scrollback_rows();
+        let mut matches = Vec::new();
+        for (phys, line) in screen.lines_in_phys_range(all).iter().enumerate() {
+            let row = screen.phys_to_stable_row_index(phys);
+            let cells: Vec<(usize, usize, String)> = line
+                .visible_cells()
+                .map(|cell| (cell.cell_index(), cell.width(), cell.str().to_string()))
+                .collect();
+            let cells = cells
+                .iter()
+                .map(|(col, width, s)| (*col, *width, s.as_str()));
+            for cols in search::spans(cells, &query) {
+                matches.push(search::Match { row, cols });
+            }
+        }
+        self.search = Some(matches);
+        self.jump_to_match(true);
+    }
+
+    /// Move the view to the nearest match above (`older`) or below its
+    /// top row. Returns whether there was one.
+    pub fn jump_to_match(&mut self, older: bool) -> bool {
+        let (Some(top), Some(matches)) = (self.scroll_top, &self.search) else {
+            return false;
+        };
+        let target = if older {
+            search::above(matches, top)
+        } else {
+            search::below(matches, top)
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        let screen = self.engine.screen();
+        let oldest = screen.phys_to_stable_row_index(0);
+        let live_top = screen.visible_row_to_stable_row(0);
+        self.scroll_top = Some(target.row.clamp(oldest, live_top));
+        true
+    }
+
+    /// Matches in the scrolled view as `(view row, columns)`.
+    pub fn visible_matches(&self) -> impl Iterator<Item = (usize, std::ops::Range<usize>)> + '_ {
+        let top = self.scroll_top;
+        let rows = self.engine.screen().physical_rows as isize;
+        self.search.iter().flatten().filter_map(move |m| {
+            let y = m.row - top?;
+            (0..rows).contains(&y).then(|| (y as usize, m.cols.clone()))
+        })
     }
 
     /// Negative `delta` scrolls into history. Returns whether the view is

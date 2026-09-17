@@ -67,6 +67,7 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `Esc` | cancel a pending yank |
 | `Y` | copy the last completed command's output to the clipboard (needs the shell's OSC 133 integration) |
 | `[` | enter scroll mode (mouse or keys; `q`/`Esc` to exit; a scrollbar on the right edge shows where you are) |
+| `/` | search the scrollback: enters scroll mode and opens a `/` prompt (plain text, case-sensitive); `Enter` jumps to the nearest match above the view and highlights every match, `n`/`N` step to older/newer matches, and `/` inside scroll mode searches again |
 | `d` | detach from the session |
 | `s` | open the session switcher |
 | `g` | open the CLAUDECOM grid |

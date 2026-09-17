@@ -187,7 +187,8 @@ struct Chrome {
     window: WindowId,
     tab_bar: Rect,
     tabs: Vec<TabBadge>,
-    scroll: bool,
+    /// The scroll-mode label, with the match count once a search ran.
+    scroll: Option<String>,
     rule: Rule,
     /// None when the bar is too narrow to hold it.
     controls: Option<Rect>,
@@ -231,6 +232,7 @@ struct StatusChrome {
 enum PromptKind {
     Ex,
     Rename,
+    Search,
 }
 
 struct Prompt {
@@ -243,6 +245,7 @@ impl Prompt {
         match self.kind {
             PromptKind::Ex => ":",
             PromptKind::Rename => "rename: ",
+            PromptKind::Search => "/",
         }
     }
 
@@ -826,6 +829,13 @@ impl Session {
                     tab.scroll_by(page);
                 }
                 CtKeyCode::Esc | CtKeyCode::Char('q') => tab.exit_scroll_mode(),
+                CtKeyCode::Char('n') => {
+                    tab.jump_to_match(true);
+                }
+                CtKeyCode::Char('N') => {
+                    tab.jump_to_match(false);
+                }
+                CtKeyCode::Char('/') => self.open_prompt(PromptKind::Search, String::new()),
                 _ => {}
             }
             self.force_redraw = true;
@@ -1208,6 +1218,12 @@ impl Session {
                     self.force_redraw = true;
                 }
             }
+            Command::Search => {
+                if let Some(win) = self.windows.get_mut(&self.focus) {
+                    win.active_tab_mut().enter_scroll_mode();
+                    self.open_prompt(PromptKind::Search, String::new());
+                }
+            }
         }
         None
     }
@@ -1285,6 +1301,16 @@ impl Session {
                             tab.clear_name(osc_titles);
                         } else {
                             tab.set_name(text);
+                        }
+                    }
+                    PromptKind::Search => {
+                        if let Some(win) = self.windows.get_mut(&self.focus)
+                            && !text.is_empty()
+                        {
+                            let tab = win.active_tab_mut();
+                            if tab.scroll_mode() {
+                                tab.search_for(text);
+                            }
                         }
                     }
                 }
@@ -2026,7 +2052,7 @@ impl Session {
                 window: id,
                 tab_bar: bar,
                 tabs,
-                scroll: win.active_tab().scroll_mode(),
+                scroll: scroll_label(win.active_tab()),
                 rule,
                 controls,
                 maximized: self.maximized == Some(id),
@@ -2123,7 +2149,7 @@ impl Session {
         };
         let suggestions = match prompt.kind {
             PromptKind::Ex => ex::suggestions(&prompt.text()),
-            PromptKind::Rename => Vec::new(),
+            PromptKind::Rename | PromptKind::Search => Vec::new(),
         };
         let suggestion_row = (!suggestions.is_empty() && self.area.height >= 2)
             .then(|| Rect::new(line.x, line.y - 1, line.width, 1));
@@ -2329,8 +2355,39 @@ fn truncate_name(name: &str, width: usize) -> String {
 fn render_window(win: &Window, palette: &Palette, buf: &mut Buffer) {
     let tab = win.active_tab();
     render_tab(tab, buf);
+    render_matches(tab, palette, buf);
     if let Some(metrics) = tab.scroll_metrics() {
         render_scrollbar(win.content_rect(), metrics, palette, buf);
+    }
+}
+
+fn scroll_label(tab: &Tab) -> Option<String> {
+    if !tab.scroll_mode() {
+        return None;
+    }
+    Some(match tab.search().map(<[_]>::len) {
+        Some(1) => " scroll · 1 match ".to_string(),
+        Some(n) => format!(" scroll · {n} matches "),
+        None => " scroll ".to_string(),
+    })
+}
+
+fn render_matches(tab: &Tab, palette: &Palette, buf: &mut Buffer) {
+    let rect = tab.rect;
+    let style = Style::default().fg(Color::Black).bg(palette.search_bg);
+    for (y, cols) in tab.visible_matches() {
+        if y >= rect.height as usize {
+            continue;
+        }
+        for x in cols {
+            if x >= rect.width as usize {
+                break;
+            }
+            let pos = Position::new(rect.x + x as u16, rect.y + y as u16);
+            if let Some(dst) = buf.cell_mut(pos) {
+                dst.set_style(style);
+            }
+        }
     }
 }
 
@@ -2454,9 +2511,8 @@ fn render_tab_bar(
         x += 1;
     }
     // So a frozen view isn't mistaken for the live tail.
-    if chrome.scroll {
-        let label = " scroll ";
-        let len = label.len() as u16;
+    if let Some(label) = &chrome.scroll {
+        let len = label.chars().count() as u16;
         if badges_end >= bar.x + len && badges_end - len >= indicators_end {
             let style = Style::default()
                 .fg(palette.mark)

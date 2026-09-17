@@ -31,6 +31,8 @@ pub struct Palette {
     pub chrome_bg: Color,
     pub suggestion_bg: Color,
     pub selection_bg: Color,
+    /// Behind search matches, under black text.
+    pub search_bg: Color,
     /// Stand-ins for the terminal's defaults where darkening needs a value.
     pub fg: Color,
     pub bg: Color,
@@ -52,6 +54,7 @@ impl Palette {
         chrome_bg: Color::Indexed(235),
         suggestion_bg: Color::Indexed(236),
         selection_bg: Color::Indexed(240),
+        search_bg: Color::Yellow,
         fg: Color::Rgb(204, 204, 204),
         bg: Color::Rgb(0, 0, 0),
     };
