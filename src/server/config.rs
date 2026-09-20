@@ -32,6 +32,14 @@ impl RuleStyle {
     }
 }
 
+/// How the first frame after attaching is revealed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AttachStyle {
+    Coalesce,
+    #[default]
+    Rain,
+}
+
 pub struct Config {
     pub keys: KeyTable,
     /// Restore persisted sessions at startup. Saving happens either way.
@@ -51,8 +59,9 @@ pub struct Config {
     pub shadows: bool,
     /// Animate splits, window removal, and maximize.
     pub layout_transitions: bool,
-    /// Reveal the first frame cell by cell after a client attaches.
+    /// Reveal the first frame gradually after a client attaches.
     pub attach_transition: bool,
+    pub attach_style: AttachStyle,
 }
 
 impl Default for Config {
@@ -70,6 +79,7 @@ impl Default for Config {
             shadows: false,
             layout_transitions: true,
             attach_transition: true,
+            attach_style: AttachStyle::default(),
         }
     }
 }
@@ -180,6 +190,13 @@ fn parse(text: &str, origin: &str) -> Result<Config, String> {
         match value.as_bool() {
             Some(animate) => config.attach_transition = animate,
             None => eprintln!("lux: {origin}: invalid attach-transition value {value}"),
+        }
+    }
+    if let Some(value) = doc.get("attach-style") {
+        match value.as_str() {
+            Some("coalesce") => config.attach_style = AttachStyle::Coalesce,
+            Some("rain") => config.attach_style = AttachStyle::Rain,
+            _ => eprintln!("lux: {origin}: invalid attach-style value {value}"),
         }
     }
     Ok(config)
@@ -320,6 +337,16 @@ mod tests {
         assert!(from_toml("attach-transition = true", "test").attach_transition);
         assert!(!from_toml("attach-transition = false", "test").attach_transition);
         assert!(from_toml("attach-transition = \"no\"", "test").attach_transition);
+    }
+
+    #[test]
+    fn attach_style_option_parses_and_defaults_to_rain() {
+        let parse = |text: &str| from_toml(text, "test").attach_style;
+        assert_eq!(parse(""), AttachStyle::Rain);
+        assert_eq!(parse("attach-style = \"rain\""), AttachStyle::Rain);
+        assert_eq!(parse("attach-style = \"coalesce\""), AttachStyle::Coalesce);
+        assert_eq!(parse("attach-style = \"snow\""), AttachStyle::Rain);
+        assert_eq!(parse("attach-style = true"), AttachStyle::Rain);
     }
 
     #[test]

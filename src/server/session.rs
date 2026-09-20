@@ -586,7 +586,11 @@ impl Session {
 
     pub fn materialize(&mut self) {
         if self.config.attach_transition {
-            self.transitions.materialize();
+            self.transitions.materialize(
+                self.config.attach_style,
+                self.config.palette,
+                self.term_colors,
+            );
         }
     }
 

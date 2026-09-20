@@ -5,15 +5,23 @@ use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use tachyonfx::{Effect, EffectTimer, Interpolation, RefCount, fx, ref_count};
 
+use crate::server::config::AttachStyle;
 use crate::server::layout::WindowId;
 use crate::server::palette::{self, Palette, TermColors};
 
 const DIM_FADE: (u32, Interpolation) = (300, Interpolation::QuadOut);
 const ZOOM: (u32, Interpolation) = (200, Interpolation::QuadOut);
 const MATERIALIZE: (u32, Interpolation) = (400, Interpolation::QuadOut);
+const RAIN: (u32, Interpolation) = (700, Interpolation::Linear);
+/// The share of the rain's run a column may wait before its drop starts.
+const RAIN_STAGGER: f32 = 0.4;
+/// The shares of the rain's run the fastest and slowest drops fall for.
+const RAIN_FALL: (f32, f32) = (0.3, 0.6);
+/// Rows dimmed behind each drop.
+const RAIN_TRAIL: u16 = 4;
 
 /// A buffer a transition draws a window from: live for a window growing,
 /// a snapshot for one shrinking.
@@ -172,9 +180,12 @@ impl Transitions {
         }
     }
 
-    pub fn materialize(&mut self) {
+    pub fn materialize(&mut self, style: AttachStyle, palette: Palette, colors: TermColors) {
         self.start();
-        self.materialize = Some(fx::coalesce_from(Style::reset(), timer(MATERIALIZE)));
+        self.materialize = Some(match style {
+            AttachStyle::Coalesce => fx::coalesce_from(Style::reset(), timer(MATERIALIZE)),
+            AttachStyle::Rain => rain(palette, colors),
+        });
     }
 
     pub fn materializing(&self) -> bool {
@@ -192,6 +203,52 @@ impl Transitions {
 
 fn timer((ms, interpolation): (u32, Interpolation)) -> EffectTimer {
     EffectTimer::from_ms(ms, interpolation)
+}
+
+/// Each column's drop starts after its own delay and falls at its own
+/// speed, blanking the cells it hasn't reached yet and dimming a trail
+/// behind it. The drop runs past the bottom so the trail leaves the frame.
+fn rain(palette: Palette, colors: TermColors) -> Effect {
+    fx::effect_fn_buf((), timer(RAIN), move |_, ctx, buf| {
+        let area = ctx.area;
+        let run = f32::from(area.height + RAIN_TRAIL);
+        let (fastest, slowest) = RAIN_FALL;
+        for x in area.left()..area.right() {
+            let delay = RAIN_STAGGER * column_noise(x, 0);
+            let fall = fastest + (slowest - fastest) * column_noise(x, 1);
+            let progress = ((ctx.alpha() - delay) / fall).clamp(0.0, 1.0);
+            let head = area.top() + (run * progress).round() as u16;
+            for y in head..area.bottom() {
+                if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                    cell.reset();
+                }
+            }
+            let trail = head.saturating_sub(RAIN_TRAIL).max(area.top());
+            for y in trail..head.min(area.bottom()) {
+                let factor = f32::from(head - y) / f32::from(RAIN_TRAIL + 1);
+                dim_cell(buf, Position::new(x, y), &palette, &colors, factor);
+            }
+        }
+    })
+}
+
+/// A default background stays as it is, matching the blank cells below.
+fn dim_cell(buf: &mut Buffer, pos: Position, palette: &Palette, colors: &TermColors, factor: f32) {
+    let default_bg = buf.cell(pos).is_some_and(|cell| cell.bg == Color::Reset);
+    palette::shade(buf, Rect::new(pos.x, pos.y, 1, 1), palette, colors, factor);
+    if default_bg && let Some(cell) = buf.cell_mut(pos) {
+        cell.bg = Color::Reset;
+    }
+}
+
+/// In `0..1`, spread so neighboring columns land far apart, and unrelated
+/// from one `salt` to the next.
+fn column_noise(x: u16, salt: u32) -> f32 {
+    let mut hash = (u32::from(x) ^ (salt << 16)).wrapping_mul(0x9E37_79B1);
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(0x85EB_CA6B);
+    hash ^= hash >> 13;
+    (hash >> 8) as f32 / (1u32 << 24) as f32
 }
 
 fn blit(src: &Buffer, buf: &mut Buffer, within: Rect, dx: i32, dy: i32) {
@@ -223,7 +280,6 @@ fn lerp(from: Rect, to: Rect, t: f32) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Color;
 
     fn filled(area: Rect, ch: char) -> Buffer {
         let mut buf = Buffer::empty(area);
@@ -236,6 +292,29 @@ mod tests {
     fn row(buf: &Buffer, y: u16) -> String {
         (buf.area.left()..buf.area.right())
             .map(|x| buf[Position::new(x, y)].symbol().chars().next().unwrap())
+            .collect()
+    }
+
+    fn materialize(t: &mut Transitions, style: AttachStyle) {
+        t.materialize(style, Palette::DEFAULT, TermColors::default());
+    }
+
+    /// Rows shown from the top of each column, asserting nothing shows
+    /// below them.
+    fn heads(buf: &Buffer) -> Vec<u16> {
+        let area = buf.area;
+        (area.left()..area.right())
+            .map(|x| {
+                let shown = |y: u16| buf[Position::new(x, y)].symbol() == "x";
+                let head = (area.top()..area.bottom())
+                    .take_while(|&y| shown(y))
+                    .count() as u16;
+                assert!(
+                    (head..area.bottom()).all(|y| !shown(y)),
+                    "column {x} fills from the top down"
+                );
+                head
+            })
             .collect()
     }
 
@@ -311,7 +390,7 @@ mod tests {
     fn an_attaching_frame_materializes_cell_by_cell() {
         let screen = Rect::new(0, 0, 8, 4);
         let mut t = Transitions::default();
-        t.materialize();
+        materialize(&mut t, AttachStyle::Coalesce);
         let mut buf = filled(screen, 'x');
         buf[Position::new(0, 0)].bg = Color::Red;
         t.reveal(&mut buf);
@@ -335,6 +414,104 @@ mod tests {
         assert!(screen.positions().all(|p| buf[p].symbol() == "x"));
         assert!(t.prune());
         assert!(!t.running());
+    }
+
+    #[test]
+    fn an_attaching_frame_rains_in_column_by_column() {
+        let screen = Rect::new(0, 0, 8, 20);
+        let mut t = Transitions::default();
+        materialize(&mut t, AttachStyle::Rain);
+        let bg = |x: u16| {
+            if x.is_multiple_of(2) {
+                Color::Red
+            } else {
+                Color::Reset
+            }
+        };
+        let painted = || {
+            let mut buf = filled(screen, 'x');
+            for pos in screen.positions() {
+                buf[pos].fg = Color::Green;
+                buf[pos].bg = bg(pos.x);
+            }
+            buf
+        };
+        let mut buf = painted();
+        t.reveal(&mut buf);
+        assert!(
+            screen
+                .positions()
+                .all(|p| buf[p].symbol() == " " && buf[p].bg == Color::Reset),
+            "starts blank, backgrounds included"
+        );
+        advance(&mut t, 350);
+        let mut buf = painted();
+        t.reveal(&mut buf);
+        let heads = heads(&buf);
+        assert!(
+            heads.iter().any(|&h| h > 0) && heads.iter().any(|&h| h < screen.height),
+            "part way through: {heads:?}"
+        );
+        assert!(heads.windows(2).any(|w| w[0] != w[1]), "columns stagger");
+        let falling = (screen.left()..screen.right())
+            .zip(&heads)
+            .filter(|&(_, &head)| head > RAIN_TRAIL && head < screen.height);
+        let none = TermColors::default();
+        for (x, &head) in falling.clone() {
+            for y in screen.top()..head {
+                let cell = &buf[Position::new(x, y)];
+                let behind = head - y;
+                if behind > RAIN_TRAIL {
+                    assert_eq!(
+                        (cell.fg, cell.bg),
+                        (Color::Green, bg(x)),
+                        "landed at {x},{y}"
+                    );
+                    continue;
+                }
+                let factor = f32::from(behind) / f32::from(RAIN_TRAIL + 1);
+                let dimmed = |color| palette::darken(color, Color::Reset, &none, factor);
+                assert_eq!(cell.fg, dimmed(Color::Green), "trail at {x},{y}");
+                let trail_bg = if bg(x) == Color::Reset {
+                    Color::Reset
+                } else {
+                    dimmed(bg(x))
+                };
+                assert_eq!(cell.bg, trail_bg, "trail background at {x},{y}");
+            }
+        }
+        assert!(falling.count() > 1, "drops mid-fall: {heads:?}");
+        advance(&mut t, 350);
+        let mut buf = painted();
+        t.reveal(&mut buf);
+        assert_eq!(buf, painted());
+        assert!(t.prune());
+        assert!(!t.running());
+    }
+
+    #[test]
+    fn rain_columns_fall_at_different_speeds() {
+        let screen = Rect::new(0, 0, 40, 40);
+        let mut t = Transitions::default();
+        materialize(&mut t, AttachStyle::Rain);
+        let mut at = |ms: u64| {
+            advance(&mut t, ms);
+            let mut buf = filled(screen, 'x');
+            t.reveal(&mut buf);
+            heads(&buf)
+        };
+        let (before, after) = (at(300), at(100));
+        let fallen: Vec<u16> = before
+            .iter()
+            .zip(&after)
+            .filter(|&(&a, &b)| a > 0 && b < screen.height)
+            .map(|(&a, &b)| b - a)
+            .collect();
+        assert!(fallen.len() > 1, "drops mid-fall: {fallen:?}");
+        assert!(
+            fallen.iter().max() > fallen.iter().min(),
+            "rows fallen in the same time: {fallen:?}"
+        );
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 ## 2026-09-20
 
+- Configuration `attach-style` accepts `rain` or `coalesce` and sets the attach
+  animation style; rain columns fall at varied speeds with a dimmed trail.
 - A Claude Code tab whose turn has ended while background shells, agents,
   or MCP tasks still run now shows `[waiting]` in light blue instead of
   working, with its elapsed time and a rule that keeps shimmering; auto

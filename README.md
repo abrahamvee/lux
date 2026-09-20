@@ -171,6 +171,7 @@ dim-unfocused = false    # leave unfocused windows at full brightness
 shadows = true           # popovers cast a shadow on the content beneath
 layout-transitions = false  # snap maximize into place
 attach-transition = false   # draw the first frame after attaching at once
+attach-style = "coalesce"   # how the first frame after attaching appears
 ```
 
 The prefix key spec is a single character, optionally prefixed with `C-`
@@ -201,6 +202,5 @@ the palette's stand-ins (light grey on black) instead.
 between its place in the layout and the full area. Set it to `false` to
 snap instead.
 
-`attach-transition` is on by default: the first frame after attaching
-materializes cell by cell rather than appearing whole. Set it to `false`
-to draw it at once.
+`attach-transition` is "rain" by default. Set it to `false`
+to turn it off..
