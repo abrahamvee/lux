@@ -195,12 +195,13 @@ static CLAUDE_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
                 ..Default::default()
             },
         },
-        // A fatal API error's transcript line. The auto-retry banner reads
-        // "API error" too, so its countdown rules it out.
+        // A fatal API error's transcript line. It is never erased, so it
+        // only counts as the last transcript line; the auto-retry banner
+        // reads "API error" too, so its countdown rules it out.
         Rule {
             state: AgentState::Blocked,
             priority: 870,
-            source: Source::Screen,
+            source: Source::LastLineAbovePrompt,
             gate: Gate {
                 regex: vec![Regex::new("API Error").expect("valid rule regex")],
                 not: vec![contains(&["retrying in"])],
@@ -928,7 +929,7 @@ mod tests {
         );
         assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Blocked);
         let s = snap(
-            "⏺ API Error: Request was aborted.\n\n✻ Thinking… (esc to interrupt)\n",
+            "● Done.\n\n⏺ API Error: Request was aborted.\n",
             "◐ claude",
             "indeterminate",
         );
@@ -937,6 +938,23 @@ mod tests {
         assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
         let s = snap(
             "────────────\n❯ why did I get API Error: 401?\n────────────\n  ~/src/lux ⎇ main\n",
+            "",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+    }
+
+    #[test]
+    fn stale_api_error_above_newer_output_is_not_blocked() {
+        let s = snap(
+            "⏺ API Error: Request was aborted.\n\n✻ Thinking… (esc to interrupt)\n",
+            "◐ claude",
+            "indeterminate",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+        let s = snap(
+            "⏺ API Error: 529 overloaded\n\n● Retried; here is the answer.\n\n\
+             ────────────\n❯\n────────────\n  ~/src/lux ⎇ main\n",
             "",
             "none",
         );
