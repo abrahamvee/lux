@@ -1966,7 +1966,6 @@ impl Session {
                 tracker.mark_seen();
             }
             let progress = win.active_tab().progress();
-            let phase = win.active_tab_mut().advance_shimmer(now);
             let active = win.active;
             let bar = win.tab_bar_rect();
             // Room for the controls past the two-cell rule lead-in.
@@ -2032,6 +2031,9 @@ impl Session {
                 .get(active)
                 .and_then(|badge| badge.agent.as_ref())
                 .map(|visual| (visual.status, visual.anim));
+            // A waiting tab is quiet while its background work runs on.
+            let waiting = matches!(status, Some((agent::Status::Waiting, _)));
+            let phase = win.active_tab_mut().advance_shimmer(now, waiting);
             let rule = match (progress, status) {
                 // A program with no agent status still reports progress
                 // on work in flight.

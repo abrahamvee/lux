@@ -139,12 +139,17 @@ impl RecentOutput {
     }
 
     /// Moves the sweep on by the time elapsed at the current output rate,
-    /// so it stands still without output.
-    fn advance(&mut self, now: Instant) -> f32 {
+    /// so it stands still without output unless `sustained`.
+    fn advance(&mut self, now: Instant, sustained: bool) -> f32 {
         self.prune(now);
         let bytes: usize = self.writes.iter().map(|w| w.len).sum();
         let rate = bytes as f32 / RATE_WINDOW.as_secs_f32();
-        let sweeps_per_sec = (rate / FULL_SPEED_RATE).min(1.0) / anim::PERIOD;
+        let pace = if sustained {
+            1.0
+        } else {
+            (rate / FULL_SPEED_RATE).min(1.0)
+        };
+        let sweeps_per_sec = pace / anim::PERIOD;
         let dt = now.duration_since(self.advanced).as_secs_f32();
         self.phase = (self.phase + sweeps_per_sec * dt).rem_euclid(1.0);
         self.advanced = now;
@@ -538,9 +543,10 @@ impl Tab {
         self.output.record(now, len);
     }
 
-    /// The rule shimmer's phase, moved on by recent output.
-    pub fn advance_shimmer(&mut self, now: Instant) -> f32 {
-        self.output.advance(now)
+    /// The rule shimmer's phase, moved on by recent output, or at full
+    /// pace while `sustained`.
+    pub fn advance_shimmer(&mut self, now: Instant, sustained: bool) -> f32 {
+        self.output.advance(now, sustained)
     }
 
     pub fn take_bell(&mut self) -> bool {
@@ -1244,20 +1250,35 @@ mod tests {
     fn shimmer_speed_follows_output_and_stops_without_it() {
         let start = Instant::now();
         let mut output = RecentOutput::new(start);
-        assert_eq!(output.advance(start + Duration::from_millis(500)), 0.0);
+        assert_eq!(
+            output.advance(start + Duration::from_millis(500), false),
+            0.0
+        );
         // Full speed sweeps at the status text's pace: 8 KiB within the
         // window moves half a sweep per second.
         output.record(start + Duration::from_millis(500), 8192);
-        let phase = output.advance(start + Duration::from_millis(1500));
+        let phase = output.advance(start + Duration::from_millis(1500), false);
         assert!((phase - 0.5).abs() < 0.01, "phase {phase}");
         // Half the rate moves half as far.
         let mut output = RecentOutput::new(start);
         output.record(start, 4096);
-        let phase = output.advance(start + Duration::from_millis(1000));
+        let phase = output.advance(start + Duration::from_millis(1000), false);
         assert!((phase - 0.25).abs() < 0.01, "phase {phase}");
         // Once the write ages out the sweep stands still.
-        let held = output.advance(start + Duration::from_millis(3000));
+        let held = output.advance(start + Duration::from_millis(3000), false);
         assert_eq!(held, phase);
+    }
+
+    #[test]
+    fn sustained_shimmer_sweeps_at_full_speed_without_output() {
+        let start = Instant::now();
+        let mut output = RecentOutput::new(start);
+        let phase = output.advance(start + Duration::from_millis(1000), true);
+        assert!((phase - 0.5).abs() < 0.01, "phase {phase}");
+        // Output on top never pushes it past the status text's pace.
+        output.record(start + Duration::from_millis(1000), 65536);
+        let phase = output.advance(start + Duration::from_millis(1500), true);
+        assert!((phase - 0.75).abs() < 0.01, "phase {phase}");
     }
 
     #[test]

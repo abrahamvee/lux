@@ -42,7 +42,7 @@ pub struct Palette {
 impl Palette {
     pub const DEFAULT: Palette = Palette {
         working: Color::Yellow,
-        waiting: Color::Blue,
+        waiting: Color::Rgb(177, 185, 249),
         blocked: Color::Red,
         done: Color::Green,
         idle: Color::DarkGray,

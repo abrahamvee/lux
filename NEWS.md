@@ -3,8 +3,9 @@
 ## 2026-09-20
 
 - A Claude Code tab whose turn has ended while background shells, agents,
-  or MCP tasks still run now shows `[waiting]` in blue instead of working,
-  with its elapsed time; auto mode's blank screen lists waiting tabs too.
+  or MCP tasks still run now shows `[waiting]` in light blue instead of
+  working, with its elapsed time and a rule that keeps shimmering; auto
+  mode's blank screen lists waiting tabs too.
 - Agent detection now sees through symlinked or wrapped installs and
   launchers run via node, bun, python, or a shell.
 - A Claude tab no longer stays blocked on an API error line once newer
