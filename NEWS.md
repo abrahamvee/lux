@@ -1,5 +1,10 @@
 # News
 
+## 2026-09-20
+
+- Pressing `n` in the session switcher creates a new session and prompts for a
+  session name.
+
 ## 2026-09-17
 
 - Prefix+`/` (or `/` in scroll mode) searches a tab's scrollback for plain

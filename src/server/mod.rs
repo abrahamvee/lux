@@ -38,6 +38,8 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
+use ratatui::widgets::Widget;
+use ratatui_textarea::TextArea;
 
 use crate::protocol::{self, Request};
 use anim::Anim;
@@ -95,6 +97,8 @@ struct Client {
     attached: SessionId,
     /// The highlighted index while in switcher mode.
     switcher: Option<usize>,
+    /// The switcher's new-session name prompt while it is open.
+    new_session: Option<TextArea<'static>>,
     grid: Option<GridState>,
     auto: Option<AutoState>,
     finder: Option<find::FinderState>,
@@ -592,6 +596,7 @@ impl Server {
                 stdin_stop,
                 attached: sid,
                 switcher: None,
+                new_session: None,
                 grid: None,
                 auto: None,
                 finder: None,
@@ -843,8 +848,29 @@ impl Server {
                 }
                 return;
             }
-            DecodedInput::Paste(_) | DecodedInput::Color(..) => return,
+            DecodedInput::Paste(text) => {
+                if let Some(prompt) = self
+                    .clients
+                    .get_mut(&conn)
+                    .and_then(|c| c.new_session.as_mut())
+                {
+                    prompt.insert_str(input::prompt_paste(text));
+                }
+                return;
+            }
+            DecodedInput::Color(..) => return,
         };
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if self
+            .clients
+            .get(&conn)
+            .is_some_and(|c| c.new_session.is_some())
+        {
+            self.new_session_prompt_input(conn, key);
+            return;
+        }
         let pinned = self.pinned_entries();
         let count = pinned + self.sessions.len();
         let Some(client) = self.clients.get_mut(&conn) else {
@@ -879,9 +905,48 @@ impl Server {
                     (highlight + 1) % count
                 });
             }
+            CtKeyCode::Char('n') if !ctrl => {
+                let mut prompt = TextArea::default();
+                // The default cursor-line underline looks like stray chrome
+                // in a one-line input.
+                prompt.set_cursor_line_style(Style::default());
+                client.new_session = Some(prompt);
+            }
             CtKeyCode::Esc => self.switcher_cancel(conn),
             CtKeyCode::Enter => self.switcher_select(conn, highlight),
             _ => {}
+        }
+    }
+
+    /// Enter creates and attaches unless the name is taken; Escape and a
+    /// taken name both return to the switcher.
+    fn new_session_prompt_input(&mut self, conn: ConnId, key: &KeyEvent) {
+        let Some(client) = self.clients.get_mut(&conn) else {
+            return;
+        };
+        let Some(prompt) = client.new_session.as_mut() else {
+            return;
+        };
+        match key.code {
+            CtKeyCode::Esc => client.new_session = None,
+            CtKeyCode::Enter => {
+                let text = prompt.lines().first().cloned().unwrap_or_default();
+                client.new_session = None;
+                let name = (!text.is_empty()).then_some(text);
+                if name
+                    .as_deref()
+                    .is_some_and(|n| self.session_by_name(n).is_some())
+                {
+                    return;
+                }
+                if let Some(client) = self.clients.get_mut(&conn) {
+                    client.switcher = None;
+                }
+                self.new_session_for(conn, name);
+            }
+            _ => {
+                prompt.input(ratatui_textarea::Input::from(*key));
+            }
         }
     }
 
@@ -890,6 +955,7 @@ impl Server {
             return;
         };
         client.switcher = None;
+        client.new_session = None;
         let sid = client.attached;
         if let Some(session) = self.sessions.get_mut(&sid) {
             session.request_redraw();
@@ -920,6 +986,7 @@ impl Server {
             return;
         };
         client.switcher = None;
+        client.new_session = None;
         if highlight < pinned {
             if self.config.automode {
                 self.begin_auto(conn);
@@ -1163,6 +1230,7 @@ impl Server {
         if let Some(client) = self.clients.get_mut(&conn) {
             client.grid = None;
             client.switcher = None;
+            client.new_session = None;
             client.finder = None;
             client.auto = Some(AutoState::default());
         }
@@ -1672,8 +1740,14 @@ fn render_switcher(
         .checked_sub(pinned)
         .and_then(|i| sessions.keys().nth(i).copied());
     let elapsed = anim::elapsed();
-    let colors = client.colors;
-    let _ = client.terminal.draw(|frame| {
+    let Client {
+        terminal,
+        new_session,
+        colors,
+        ..
+    } = client;
+    let colors = *colors;
+    let _ = terminal.draw(|frame| {
         let area = frame.area();
         let buf = frame.buffer_mut();
         clear_region(buf, area);
@@ -1744,8 +1818,33 @@ fn render_switcher(
             };
             palette::shadow(buf, panel, area, palette, &colors);
         }
+        // The prompt takes the bottom row, where the command line lives.
+        if let Some(prompt) = new_session.as_ref()
+            && area.height > 0
+        {
+            let label = NEW_SESSION_LABEL;
+            let label_len = label.chars().count() as u16;
+            if area.width <= label_len {
+                return;
+            }
+            let line = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+            clear_region(buf, line);
+            for (i, ch) in label.chars().enumerate() {
+                if let Some(dst) = buf.cell_mut(Position::new(line.x + i as u16, line.y)) {
+                    dst.set_char(ch);
+                }
+            }
+            let input = Rect {
+                x: line.x + label_len,
+                width: line.width - label_len,
+                ..line
+            };
+            prompt.render(input, buf);
+        }
     });
 }
+
+const NEW_SESSION_LABEL: &str = "new session: ";
 
 pub(crate) fn clear_region(buf: &mut Buffer, area: Rect) {
     for y in area.top()..area.bottom() {

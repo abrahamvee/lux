@@ -108,6 +108,8 @@ Ex commands (typed after `:`, with autocomplete):
 Prefix+`s` opens the session switcher: a list of sessions with a live
 preview. Move the highlight with `j`/`k`, the arrow keys, or readline-style
 `Ctrl-n`/`Ctrl-p`; `Enter` (or clicking an entry) attaches, `Esc` cancels.
+`n` prompts for a name and creates a new session, attaching to it (leave
+the name empty to auto-name it; a taken name returns to the switcher).
 Clicking the `☢` icon at the left of the status bar opens it too; while
 the switcher is open the icon shows as `○`, and clicking it exits.
 
