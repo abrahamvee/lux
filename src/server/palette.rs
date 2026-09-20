@@ -11,6 +11,7 @@ use crate::server::agent::Status;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Palette {
     pub working: Color,
+    pub waiting: Color,
     pub blocked: Color,
     pub done: Color,
     pub idle: Color,
@@ -41,6 +42,7 @@ pub struct Palette {
 impl Palette {
     pub const DEFAULT: Palette = Palette {
         working: Color::Yellow,
+        waiting: Color::Blue,
         blocked: Color::Red,
         done: Color::Green,
         idle: Color::DarkGray,
@@ -69,6 +71,7 @@ impl Palette {
     pub fn status(&self, status: Status) -> Color {
         match status {
             Status::Working => self.working,
+            Status::Waiting => self.waiting,
             Status::Blocked => self.blocked,
             Status::Done => self.done,
             Status::Idle => self.idle,
@@ -272,6 +275,7 @@ mod tests {
     fn status_colors_come_from_the_palette() {
         let p = Palette::DEFAULT;
         assert_eq!(p.status(Status::Working), p.working);
+        assert_eq!(p.status(Status::Waiting), p.waiting);
         assert_eq!(p.status(Status::Blocked), p.blocked);
         assert_eq!(p.status(Status::Done), p.done);
         assert_eq!(p.status(Status::Idle), p.idle);

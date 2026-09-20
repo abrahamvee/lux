@@ -1254,7 +1254,7 @@ impl Server {
                     self.sessions[&sid]
                         .tab_at(window, index)
                         .and_then(|t| t.agent.as_ref())
-                        .is_none_or(|t| !t.working())
+                        .is_none_or(|t| !t.busy())
                 });
                 if keep {
                     continue;

@@ -9,7 +9,10 @@ differentiating features.
   and a tab can be yanked and pasted into another window, even in another
   session.
 - Agents: Lux detects Claude Code, Codex, and Kiro CLI and reports their
-  status in the tab bar: working, idle, done, blocked.
+  status in the tab bar: working, waiting (the turn is over but background
+  shells, agents, or MCP tasks still run), idle, done, blocked. Detection
+  sees through symlinked or wrapped installs and launchers run via node,
+  bun, python, or a shell.
 - vim/helix style: prefix+`:` opens a command line with autocomplete, and
   commands like `:vs`/`:sp` mirror vim's split bindings.
 
@@ -144,7 +147,7 @@ done or blocked at a time. Once that tab starts working again or goes
 away, it hands off automatically to the next such tab, in the same order
 the grid uses. Prefix+`Tab` skips to the next one manually. When no tab
 needs attention, it shows a blank screen — "Claude doesn't need you right
-now" — with a list of tabs still working underneath.
+now" — with a list of tabs still working or waiting underneath.
 
 ## Configuration
 

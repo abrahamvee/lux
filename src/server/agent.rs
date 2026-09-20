@@ -17,6 +17,9 @@ pub const IDLE_DEBOUNCE: Duration = Duration::from_millis(400);
 pub enum AgentState {
     Idle,
     Working,
+    /// The turn has ended but background shells, agents, or MCP tasks
+    /// are still running.
+    Waiting,
     Blocked,
 }
 
@@ -51,6 +54,7 @@ impl Urgency {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
     Working,
+    Waiting,
     Blocked,
     Done,
     Idle,
@@ -237,7 +241,7 @@ static CLAUDE_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         // The status line's shell count, which outlives the turn's other
         // evidence.
         Rule {
-            state: AgentState::Working,
+            state: AgentState::Waiting,
             priority: 780,
             source: Source::Screen,
             gate: regex(&[r"(?m)^\s*[⏸⏵].*·\s+[1-9]\d*\s+shells?(?:\s+·|\s*$)"]),
@@ -245,10 +249,36 @@ static CLAUDE_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         // The background-agent wait line. It isn't erased when the agents
         // finish, so it only counts as the last transcript line.
         Rule {
-            state: AgentState::Working,
+            state: AgentState::Waiting,
             priority: 770,
             source: Source::LastLineAbovePrompt,
             gate: regex(&[r"^\s*[*·✢✶✻✽]\s+Waiting for [1-9]\d* background agents? to finish\s*$"]),
+        },
+        // The activity summary's MCP task count. The summary starts at
+        // column zero with wrapped continuations indented, which keeps a
+        // typed prompt from posing as the signal; permission and
+        // connection prompts quote similar text and are ruled out.
+        Rule {
+            state: AgentState::Waiting,
+            priority: 760,
+            source: Source::Screen,
+            gate: Gate {
+                regex: vec![
+                    Regex::new(
+                        r"(?m)^[*·✢✶✻✽][ \t]+\S[^\n]*?(?:\n[ \t]+[^\n]*?){0,3}·(?:[ \t]+|\n[ \t]*)[1-9]\d*(?:[ \t]+|\n[ \t]*)MCP(?:[ \t]+|\n[ \t]*)tasks?(?:[ \t]+|\n[ \t]*)still(?:[ \t]+|\n[ \t]*)running[ \t]*$",
+                    )
+                    .expect("valid rule regex"),
+                ],
+                not: vec![
+                    contains(&["do you want to proceed?"]),
+                    contains(&["esc to cancel"]),
+                    contains(&["waiting for permission"]),
+                    contains(&["do you want to allow this connection?"]),
+                    contains(&["tab to amend"]),
+                    contains(&["ctrl+e to explain"]),
+                ],
+                ..Default::default()
+            },
         },
     ]
 });
@@ -538,15 +568,16 @@ impl Tracker {
         self.seen = true;
     }
 
-    pub fn working(&self) -> bool {
-        self.displayed == AgentState::Working
+    /// Working or waiting: the agent or its background work is still going.
+    pub fn busy(&self) -> bool {
+        matches!(self.displayed, AgentState::Working | AgentState::Waiting)
     }
 
     pub fn needs_attention(&self) -> bool {
         match self.displayed {
             AgentState::Blocked => true,
             AgentState::Idle => !self.seen,
-            AgentState::Working => false,
+            AgentState::Working | AgentState::Waiting => false,
         }
     }
 
@@ -561,13 +592,14 @@ impl Tracker {
             (AgentState::Working, _) => Some(Urgency::Working),
             (AgentState::Blocked, _) => Some(Urgency::Blocked),
             (AgentState::Idle, false) => Some(Urgency::Done),
-            (AgentState::Idle, true) => None,
+            (AgentState::Idle, true) | (AgentState::Waiting, _) => None,
         }
     }
 
     pub fn visual(&self, now: Instant) -> Visual {
         let (state, status, anim) = match (self.displayed, self.seen) {
             (AgentState::Working, _) => ("working", Status::Working, Anim::Shimmer),
+            (AgentState::Waiting, _) => ("waiting", Status::Waiting, Anim::Shimmer),
             (AgentState::Blocked, _) => ("blocked", Status::Blocked, Anim::Breathe),
             (AgentState::Idle, false) => ("done", Status::Done, Anim::None),
             (AgentState::Idle, true) => ("idle", Status::Idle, Anim::None),
@@ -683,23 +715,33 @@ mod tests {
     }
 
     #[test]
-    fn background_shell_count_is_working() {
+    fn background_shell_count_is_waiting() {
         let s = snap(
             "⏵⏵ auto mode on (shift+tab to cycle) · 2 shells\n",
             "",
             "none",
         );
-        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Waiting);
         let s = snap("⏸ plan mode · 1 shell · ctx 6%\n", "", "none");
-        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Waiting);
         let s = snap("the script created 2 shells\n", "", "none");
         assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
     }
 
     #[test]
-    fn background_agents_line_is_working() {
-        let s = snap("✻ Waiting for 2 background agents to finish\n", "", "none");
+    fn a_turn_in_progress_outranks_background_shells() {
+        let s = snap(
+            "✶ Herding… (esc to interrupt)\n⏸ plan mode · 1 shell\n",
+            "",
+            "none",
+        );
         assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+    }
+
+    #[test]
+    fn background_agents_line_is_waiting() {
+        let s = snap("✻ Waiting for 2 background agents to finish\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Waiting);
         let s = snap("Waiting for 2 background agents to finish\n", "", "none");
         assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
         let s = snap(
@@ -709,7 +751,49 @@ mod tests {
             "",
             "none",
         );
-        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Waiting);
+    }
+
+    #[test]
+    fn mcp_task_count_is_waiting() {
+        let s = snap(
+            "✻ Cogitated for 12s · 1 MCP task still running\n",
+            "",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Waiting);
+        let s = snap(
+            "· Ran three checks and summarized the results\n  \
+             · 2 MCP tasks still running\n",
+            "",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Waiting);
+        let s = snap(
+            "✻ Cogitated for 12s · 1 MCP task still running\n\
+             Waiting for permission\n",
+            "",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+        let s = snap("  ✻ Cogitated · 1 MCP task still running\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+        let s = snap("✻ Cogitated · 0 MCP tasks still running\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+    }
+
+    #[test]
+    fn waiting_is_busy_but_needs_no_attention() {
+        let now = Instant::now();
+        let mut tracker = Tracker::new(AgentKind::Claude);
+        tracker.observe(AgentState::Waiting, now);
+        assert!(tracker.busy());
+        assert!(!tracker.needs_attention());
+        assert_eq!(tracker.urgency(), None);
+        let visual = tracker.visual(now + Duration::from_secs(5));
+        assert_eq!(visual.text, "[waiting 5s]");
+        assert_eq!(visual.status, Status::Waiting);
+        assert_eq!(visual.anim, Anim::Shimmer);
     }
 
     #[test]

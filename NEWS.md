@@ -2,6 +2,11 @@
 
 ## 2026-09-20
 
+- A Claude Code tab whose turn has ended while background shells, agents,
+  or MCP tasks still run now shows `[waiting]` in blue instead of working,
+  with its elapsed time; auto mode's blank screen lists waiting tabs too.
+- Agent detection now sees through symlinked or wrapped installs and
+  launchers run via node, bun, python, or a shell.
 - Pressing `n` in the session switcher creates a new session and prompts for a
   session name.
 

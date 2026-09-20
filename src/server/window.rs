@@ -261,25 +261,36 @@ fn content_rect(rect: Rect) -> Rect {
     }
 }
 
-/// The foreground command name from both /proc sources, since `comm` may be
-/// truncated or wrapped.
+/// The foreground command's name from every /proc source: `comm` may be
+/// truncated, argv[0] may be a symlink or wrapper, and a launcher run
+/// through an interpreter names the agent only in its script argument.
 struct Foreground {
     comm: String,
     arg0: String,
+    /// Basename of the executable's real path.
+    exe: String,
+    /// The agent a generic interpreter or shell was given to run.
+    wrapped: Option<&'static str>,
 }
 
 impl Foreground {
+    fn names(&self) -> impl Iterator<Item = &str> {
+        [self.comm.as_str(), self.arg0.as_str(), self.exe.as_str()]
+            .into_iter()
+            .chain(self.wrapped)
+    }
+
     fn is_claude(&self) -> bool {
-        self.comm == "claude" || self.arg0 == "claude"
+        self.names().any(|name| name == "claude")
     }
 
     fn is_codex(&self) -> bool {
-        self.comm == "codex" || self.arg0 == "codex"
+        self.names().any(|name| name == "codex")
     }
 
     fn is_kiro(&self) -> bool {
-        ["kiro", "kiro-cli"].contains(&self.comm.as_str())
-            || ["kiro", "kiro-cli"].contains(&self.arg0.as_str())
+        self.names()
+            .any(|name| ["kiro", "kiro-cli"].contains(&name))
     }
 
     fn agent_kind(&self) -> Option<AgentKind> {
@@ -300,6 +311,81 @@ impl Foreground {
         } else {
             &self.arg0
         }
+    }
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+}
+
+/// The agent named by the script or command a generic interpreter or
+/// shell was invoked with, as its plain command name.
+fn wrapped_agent(argv: &[String]) -> Option<&'static str> {
+    let interpreter = basename(argv.first()?);
+    let python = interpreter
+        .strip_prefix("python")
+        .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'));
+    // Inline code (`-e`, python's `-c`) runs no script; a shell's `-c`
+    // runs a command whose first word is the program.
+    let (code_flags, command_flag, value_flags): (&[&str], Option<&str>, &[&str]) =
+        match interpreter {
+            "node" | "bun" => (
+                &["-e", "--eval", "-p", "--print"],
+                None,
+                &[
+                    "-r",
+                    "--require",
+                    "--loader",
+                    "--import",
+                    "--experimental-loader",
+                ],
+            ),
+            "sh" | "bash" | "zsh" | "fish" => (&[], Some("-c"), &[]),
+            _ if python => (&["-c"], None, &["-m", "-W", "-X"]),
+            _ => return None,
+        };
+    let mut args = argv.iter().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return agent_in_path(args.next()?);
+        }
+        if code_flags.contains(&arg.as_str()) {
+            return None;
+        }
+        if command_flag == Some(arg.as_str()) {
+            let command = args.next()?;
+            let program = command.split_whitespace().find(|word| *word != "exec")?;
+            return agent_in_path(program.trim_matches(['"', '\'']));
+        }
+        if arg.starts_with('-') {
+            if value_flags.contains(&arg.as_str()) {
+                args.next();
+            }
+            continue;
+        }
+        return agent_in_path(arg);
+    }
+    None
+}
+
+/// The agent a script path names, by its basename or, for Claude Code's
+/// npm package entry point, by the package directory.
+fn agent_in_path(path: &str) -> Option<&'static str> {
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let file = parts.last()?;
+    let stem = [".js", ".mjs", ".cjs", ".py", ".sh"]
+        .into_iter()
+        .find_map(|ext| file.strip_suffix(ext))
+        .unwrap_or(file);
+    match stem {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "kiro" | "kiro-cli" => Some("kiro"),
+        _ => parts
+            .ends_with(&["@anthropic-ai", "claude-code", file])
+            .then_some("claude"),
     }
 }
 
@@ -588,7 +674,7 @@ impl Tab {
         let blocked = match entered? {
             AgentState::Idle => false,
             AgentState::Blocked => true,
-            AgentState::Working => return None,
+            AgentState::Working | AgentState::Waiting => return None,
         };
         Some(Notice {
             tab: self.name.clone(),
@@ -601,14 +687,21 @@ impl Tab {
         let pid = self.master.process_group_leader()?;
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-        let arg0 = cmdline.split(|b| *b == 0).next().unwrap_or(b"");
-        let arg0 = std::path::Path::new(&String::from_utf8_lossy(arg0).into_owned())
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
+        let argv: Vec<String> = cmdline
+            .split(|b| *b == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        let arg0 = argv.first().map(|arg| basename(arg).to_string());
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
             .unwrap_or_default();
         Some(Foreground {
             comm: comm.trim().to_string(),
-            arg0,
+            arg0: arg0.unwrap_or_default(),
+            exe,
+            wrapped: wrapped_agent(&argv),
         })
     }
 
@@ -862,7 +955,13 @@ mod tests {
         Foreground {
             comm: comm.into(),
             arg0: arg0.into(),
+            exe: String::new(),
+            wrapped: None,
         }
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
@@ -877,6 +976,66 @@ mod tests {
         assert!(fg("claude", "node").is_claude());
         assert!(fg("node", "claude").is_claude());
         assert!(!fg("node", "node").is_claude());
+    }
+
+    #[test]
+    fn a_wrapped_or_symlinked_binary_is_identified_by_its_real_path() {
+        let mut wrapped = fg(".codex-wrapped", ".codex-wrapped");
+        assert_eq!(wrapped.agent_kind(), None);
+        wrapped.exe = "codex".into();
+        assert_eq!(wrapped.agent_kind(), Some(AgentKind::Codex));
+        let mut launcher = fg("node", "node");
+        launcher.wrapped = Some("claude");
+        assert_eq!(launcher.agent_kind(), Some(AgentKind::Claude));
+        let mut kiro = fg("bash", "bash");
+        kiro.wrapped = Some("kiro");
+        assert_eq!(kiro.agent_kind(), Some(AgentKind::Kiro));
+    }
+
+    #[test]
+    fn interpreter_script_arguments_name_the_agent() {
+        let wrapped = |args: &[&str]| wrapped_agent(&argv(args));
+        assert_eq!(
+            wrapped(&[
+                "node",
+                "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+            ]),
+            Some("claude")
+        );
+        assert_eq!(
+            wrapped(&["/usr/bin/node", "--no-warnings", "/opt/codex/bin/codex.js"]),
+            Some("codex")
+        );
+        assert_eq!(
+            wrapped(&["bun", "-r", "./preload.js", "/home/u/.bun/bin/claude"]),
+            Some("claude")
+        );
+        assert_eq!(wrapped(&["python3.12", "/opt/kiro-cli"]), Some("kiro"));
+        assert_eq!(
+            wrapped(&["sh", "/nix/store/abc/bin/claude"]),
+            Some("claude")
+        );
+        assert_eq!(
+            wrapped(&["bash", "-c", "exec claude --resume"]),
+            Some("claude")
+        );
+        assert_eq!(
+            wrapped(&["zsh", "-c", "'/opt/codex/bin/codex' \"$@\""]),
+            Some("codex")
+        );
+        assert_eq!(wrapped(&["node", "--", "/x/kiro.js"]), Some("kiro"));
+    }
+
+    #[test]
+    fn unrelated_arguments_name_no_agent() {
+        let wrapped = |args: &[&str]| wrapped_agent(&argv(args));
+        assert_eq!(wrapped(&["node", "/x/app/index.js"]), None);
+        assert_eq!(wrapped(&["node", "-e", "claude"]), None);
+        assert_eq!(wrapped(&["python3", "-m", "claude"]), None);
+        assert_eq!(wrapped(&["bash", "-c", "ls claude"]), None);
+        assert_eq!(wrapped(&["vim", "claude"]), None);
+        assert_eq!(wrapped(&["node"]), None);
+        assert_eq!(wrapped(&[]), None);
     }
 
     #[test]

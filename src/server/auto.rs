@@ -56,7 +56,7 @@ pub fn render_blank(
     }
     let width = area.width.min(LIST_WIDTH);
     let x0 = area.x + (area.width - width) / 2;
-    let mut entries = working_entries(sessions, palette);
+    let mut entries = busy_entries(sessions, palette);
     if entries.is_empty() {
         entries = vec![
             ALL_IDLE
@@ -80,9 +80,9 @@ pub fn render_blank(
     }
 }
 
-/// Working agent tabs in grid order, formatted like the grid's tile headers
-/// but with the status uncolored.
-fn working_entries(sessions: &BTreeMap<SessionId, Session>, palette: &Palette) -> Vec<Run> {
+/// Working and waiting agent tabs in grid order, formatted like the grid's
+/// tile headers but with the status uncolored.
+fn busy_entries(sessions: &BTreeMap<SessionId, Session>, palette: &Palette) -> Vec<Run> {
     let now = std::time::Instant::now();
     let elapsed = anim::elapsed();
     grid::items(sessions)
@@ -90,7 +90,7 @@ fn working_entries(sessions: &BTreeMap<SessionId, Session>, palette: &Palette) -
         .filter_map(|item| {
             let session = sessions.get(&item.session)?;
             let tab = session.tab_at(item.window, item.tab)?;
-            let tracker = tab.agent.as_ref().filter(|t| t.working())?;
+            let tracker = tab.agent.as_ref().filter(|t| t.busy())?;
             let visual = tracker.visual(now);
             let mut run = Run::new();
             let len = visual.text.chars().count();
