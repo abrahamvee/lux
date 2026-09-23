@@ -100,7 +100,7 @@ pub enum ColorSlot {
 
 /// What the attached terminal answered about its own colors, `None` for
 /// each it has not answered.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TermColors {
     pub fg: Option<(u8, u8, u8)>,
     pub bg: Option<(u8, u8, u8)>,

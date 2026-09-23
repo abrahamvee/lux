@@ -156,6 +156,57 @@ pub fn kill_server() -> i32 {
     0
 }
 
+/// Relays an adopting hub's frames between ssh's stdio and this host's
+/// server, starting the server if none is running.
+pub fn proxy() -> i32 {
+    let mut stream = match connect_or_spawn() {
+        Ok(stream) => stream,
+        Err(err) => {
+            eprintln!("lux: cannot reach server: {err}");
+            return 1;
+        }
+    };
+    if protocol::write_line(&mut stream, Request::Proxy.encode().trim_end()).is_err() {
+        eprintln!("lux: server connection failed");
+        return 1;
+    }
+    // Frames must not start until the server has read the request on its
+    // own, or they'd share its first read.
+    match protocol::read_line(&mut stream) {
+        Ok(Some(line)) if line == "ok" => {}
+        Ok(Some(line)) => {
+            eprintln!("lux: {}", line.strip_prefix("err ").unwrap_or(&line));
+            return 1;
+        }
+        _ => {
+            eprintln!("lux: server closed the connection");
+            return 1;
+        }
+    }
+    let Ok(mut to_server) = stream.try_clone() else {
+        return 1;
+    };
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut to_server);
+        let _ = to_server.shutdown(std::net::Shutdown::Write);
+    });
+    // Stdout is line-buffered, so each chunk is flushed by hand.
+    let mut out = std::io::stdout().lock();
+    let mut buf = [0u8; 1 << 16];
+    loop {
+        match std::io::Read::read(&mut stream, &mut buf) {
+            Ok(0) | Err(_) => return 0,
+            Ok(n) => {
+                if std::io::Write::write_all(&mut out, &buf[..n]).is_err()
+                    || std::io::Write::flush(&mut out).is_err()
+                {
+                    return 0;
+                }
+            }
+        }
+    }
+}
+
 fn connect_existing() -> Option<UnixStream> {
     match UnixStream::connect(protocol::socket_path()) {
         Ok(stream) => Some(stream),

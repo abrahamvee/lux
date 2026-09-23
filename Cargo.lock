@@ -186,6 +186,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -232,6 +241,9 @@ name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "bitstream-io"
@@ -1326,6 +1338,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "base64",
+ "bincode",
  "chrono",
  "portable-pty",
  "ratatui",
@@ -2746,6 +2759,7 @@ dependencies = [
  "pest",
  "pest_derive",
  "phf",
+ "serde",
  "sha2",
  "signal-hook 0.3.18",
  "siphasher",
@@ -3000,6 +3014,7 @@ dependencies = [
  "atomic",
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
@@ -3211,6 +3226,7 @@ version = "0.1.1"
 source = "git+https://github.com/wezterm/wezterm?rev=4fbd6b8e90e2326b8e25c589768f98bd71ddd047#4fbd6b8e90e2326b8e25c589768f98bd71ddd047"
 dependencies = [
  "getrandom 0.3.4",
+ "serde",
  "sha2",
  "thiserror 1.0.69",
  "uuid",
@@ -3331,6 +3347,7 @@ dependencies = [
  "ordered-float",
  "pest",
  "pest_derive",
+ "serde",
  "sha2",
  "thiserror 2.0.20",
  "vtparse 0.7.0",
@@ -3375,6 +3392,7 @@ dependencies = [
  "finl_unicode 1.3.0",
  "fixedbitset 0.4.2",
  "ordered-float",
+ "serde",
  "siphasher",
  "unicode-segmentation",
  "wezterm-bidi 0.2.3 (git+https://github.com/wezterm/wezterm?rev=4fbd6b8e90e2326b8e25c589768f98bd71ddd047)",

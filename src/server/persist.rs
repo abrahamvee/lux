@@ -40,7 +40,7 @@ pub struct TabSnapshot {
 }
 
 /// Mirrors `Node` so refactors don't change the on-disk format.
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub enum NodeSnapshot {
     Leaf(WindowId),
     Split {

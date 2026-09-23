@@ -4,17 +4,18 @@ use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::layout::Rect;
-use termwiz::cell::SemanticType;
+use termwiz::cell::{CellAttributes, SemanticType};
+use termwiz::input::{KeyCode, Modifiers};
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
-    Alert, AlertHandler, Clipboard, ClipboardSelection, Progress, Terminal as Engine,
+    Alert, AlertHandler, Clipboard, ClipboardSelection, MouseEvent, Progress, Terminal as Engine,
     TerminalConfiguration, TerminalSize,
 };
 
@@ -22,8 +23,11 @@ use crate::server::ServerEvent;
 use crate::server::agent::{self, AgentKind, AgentState, Tracker};
 use crate::server::anim;
 use crate::server::config::OscTitles;
+use crate::server::host::HostLink;
 use crate::server::layout::WindowId;
+use crate::server::palette::TermColors;
 use crate::server::search;
+use crate::server::wire::{HubMsg, RemoteTabId, ScreenState, TabMeta, TabRef, TabSnap, TabUpdate};
 
 pub type TabId = usize;
 
@@ -31,12 +35,35 @@ pub type TabId = usize;
 /// their session.
 static NEXT_TAB_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The adopting hub's terminal colors, which programs' color queries are
+/// answered with while it is connected.
+static HUB_COLORS: RwLock<Option<ColorPalette>> = RwLock::new(None);
+
+pub fn set_hub_colors(colors: Option<&TermColors>) {
+    let palette = colors.map(|colors| {
+        let mut palette = ColorPalette::default();
+        if let Some(rgb) = colors.fg {
+            palette.foreground = rgb.into();
+        }
+        if let Some(rgb) = colors.bg {
+            palette.background = rgb.into();
+        }
+        for (slot, rgb) in palette.colors.0.iter_mut().zip(colors.ansi) {
+            if let Some(rgb) = rgb {
+                *slot = rgb.into();
+            }
+        }
+        palette
+    });
+    *HUB_COLORS.write().unwrap() = palette;
+}
+
 #[derive(Debug)]
 struct LuxConfig;
 
 impl TerminalConfiguration for LuxConfig {
     fn color_palette(&self) -> ColorPalette {
-        ColorPalette::default()
+        HUB_COLORS.read().unwrap().clone().unwrap_or_default()
     }
 }
 
@@ -160,6 +187,7 @@ impl RecentOutput {
 /// A tab's agent reaching done or blocked, for the server to raise a
 /// desktop notification.
 pub struct Notice {
+    pub id: TabId,
     pub tab: String,
     pub blocked: bool,
     pub summary: Option<String>,
@@ -175,14 +203,13 @@ pub struct Window {
 }
 
 impl Window {
-    pub fn new(id: WindowId, rect: Rect, tx: Sender<ServerEvent>) -> anyhow::Result<Self> {
-        let tab = Tab::spawn(content_rect(rect), None, tx)?;
-        Ok(Self {
+    pub fn with_tab(id: WindowId, rect: Rect, tab: Tab) -> Self {
+        Self {
             id,
             rect,
             tabs: vec![tab],
             active: 0,
-        })
+        }
     }
 
     pub fn active_tab(&self) -> &Tab {
@@ -257,7 +284,7 @@ impl Window {
     }
 }
 
-fn content_rect(rect: Rect) -> Rect {
+pub fn content_rect(rect: Rect) -> Rect {
     // The one chrome row is the tab bar, which also divides stacked windows.
     Rect {
         y: rect.y + rect.height.min(1),
@@ -423,8 +450,51 @@ pub struct Tab {
     /// Set while the tab is off screen, cleared once it is looked at.
     pub activity: Option<Activity>,
     output: RecentOutput,
-    master: Box<dyn MasterPty>,
-    child: Box<dyn Child + Send + Sync>,
+    /// Output and bell not yet reported to an adopting hub.
+    unsent_bytes: usize,
+    unsent_bell: bool,
+    io: Io,
+}
+
+enum Io {
+    /// The engine is the authority on the PTY's screen.
+    Local {
+        master: Box<dyn MasterPty>,
+        child: Box<dyn Child + Send + Sync>,
+    },
+    /// The engine mirrors a connected host's tab.
+    Remote(RemoteIo),
+}
+
+struct RemoteIo {
+    link: HostLink,
+    wire: TabRef,
+    id: Option<RemoteTabId>,
+    meta: TabMeta,
+    /// The host's stable row index minus the engine's, on the current
+    /// screen.
+    delta: isize,
+    /// The primary screen's `delta`, kept while the alternate screen is up.
+    primary_delta: isize,
+    /// False when the snapshot arrived on the alternate screen, so the
+    /// primary screen was never sent.
+    primary_known: bool,
+    requested: (u16, u16),
+}
+
+/// What a remote update did, for activity marks and redraws.
+#[derive(Default)]
+pub struct RemoteChange {
+    pub output: bool,
+    pub bell: bool,
+    pub display: bool,
+}
+
+/// Tracks what an adopting hub has been sent of one tab.
+pub struct Synced {
+    seqno: usize,
+    screen: ScreenState,
+    meta: TabMeta,
 }
 
 impl Tab {
@@ -503,6 +573,23 @@ impl Tab {
             tx: relay_tx,
         });
         engine.set_clipboard(&clipboard);
+        let mut tab = Self::assemble(
+            id,
+            engine,
+            rect,
+            Io::Local {
+                master: pair.master,
+                child,
+            },
+        );
+        tab.name = std::path::Path::new(argv[0])
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| argv[0].to_string());
+        Ok(tab)
+    }
+
+    fn assemble(id: TabId, mut engine: Engine, rect: Rect, io: Io) -> Self {
         let notify_text = Arc::new(Mutex::new(None));
         let osc_title = Arc::new(Mutex::new(None));
         let bell = Arc::new(AtomicBool::new(false));
@@ -511,15 +598,9 @@ impl Tab {
             title: osc_title.clone(),
             bell: bell.clone(),
         }));
-
-        let name = std::path::Path::new(argv[0])
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| argv[0].to_string());
-
-        Ok(Self {
+        Self {
             id,
-            name,
+            name: String::new(),
             manual_name: false,
             engine,
             rect,
@@ -534,9 +615,349 @@ impl Tab {
             bell,
             activity: None,
             output: RecentOutput::new(Instant::now()),
-            master: pair.master,
-            child,
-        })
+            unsent_bytes: 0,
+            unsent_bell: false,
+            io,
+        }
+    }
+
+    /// A tab the hub asked a host to spawn, blank until the host answers.
+    pub fn remote_placeholder(link: HostLink, token: u64, rect: Rect) -> Self {
+        let id = NEXT_TAB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let size = (rect.width.max(1), rect.height.max(1));
+        let io = Io::Remote(RemoteIo {
+            link,
+            wire: TabRef::Token(token),
+            id: None,
+            meta: TabMeta {
+                name: String::new(),
+                progress: None,
+                mouse_grabbed: false,
+                agent: None,
+            },
+            delta: 0,
+            primary_delta: 0,
+            primary_known: true,
+            requested: size,
+        });
+        Self::assemble(id, mirror_engine(size.0, size.1), rect, io)
+    }
+
+    pub fn from_remote(link: HostLink, snap: TabSnap, now: Instant) -> Self {
+        let wire = TabRef::Id(snap.id);
+        let rect = Rect::new(0, 0, snap.screen.cols, snap.screen.rows);
+        let mut tab = Self::remote_placeholder(link, 0, rect);
+        if let Io::Remote(io) = &mut tab.io {
+            io.wire = wire;
+        }
+        tab.load_remote(snap, now);
+        tab
+    }
+
+    /// Replaces the mirror with a host's whole copy of the tab.
+    pub fn load_remote(&mut self, snap: TabSnap, now: Instant) {
+        let Io::Remote(io) = &mut self.io else {
+            return;
+        };
+        io.id = Some(snap.id);
+        let state = snap.screen;
+        let mut engine = mirror_engine(state.cols, state.rows);
+        if state.alt {
+            engine.advance_bytes(b"\x1b[?1049h");
+        }
+        let rows = usize::from(state.rows.max(1));
+        let seqno = engine.current_seqno();
+        let screen = engine.screen_mut();
+        let mut missing = snap.lines.len().saturating_sub(screen.scrollback_rows());
+        while missing > 0 {
+            let step = missing.min(rows);
+            screen.scroll_up(
+                &(0..rows as i64),
+                step,
+                seqno,
+                CellAttributes::default(),
+                LuxConfig.bidi_mode(),
+            );
+            missing -= step;
+        }
+        // Lines align to the bottom, where the visible rows are.
+        let held = screen.scrollback_rows();
+        let skip = snap.lines.len().saturating_sub(held);
+        let first = held - (snap.lines.len() - skip);
+        for (i, line) in snap.lines.into_iter().skip(skip).enumerate() {
+            *screen.line_mut(first + i) = line;
+        }
+        io.delta = state.top - screen.visible_row_to_stable_row(0);
+        io.primary_known = !state.alt;
+        sync_cursor(&mut engine, &state);
+        self.engine = engine;
+        // The replaced engine's seqno means nothing to the new one.
+        self.drawn_seqno = usize::MAX;
+        self.scroll_top = None;
+        self.search = None;
+        self.apply_meta(snap.meta, now);
+    }
+
+    pub fn apply_remote(&mut self, update: TabUpdate, now: Instant) -> RemoteChange {
+        let Io::Remote(io) = &mut self.io else {
+            return RemoteChange::default();
+        };
+        let state = update.screen;
+        let mut resync = false;
+        let was_alt = self.engine.is_alt_screen_active();
+        let size = self.engine.get_size();
+        let resized = size.cols != usize::from(state.cols) || size.rows != usize::from(state.rows);
+        if resized {
+            self.engine
+                .resize(term_size(Rect::new(0, 0, state.cols, state.rows)));
+            // The host's primary screen reflowed out of sight.
+            if was_alt || state.alt {
+                io.primary_known = false;
+            }
+        }
+        if state.alt && !was_alt {
+            io.primary_delta = io.delta;
+            self.engine.advance_bytes(b"\x1b[?1049h");
+        } else if !state.alt && was_alt {
+            self.engine.advance_bytes(b"\x1b[?1049l");
+            io.delta = io.primary_delta;
+            resync |= !io.primary_known;
+        }
+        let top = self.engine.screen().visible_row_to_stable_row(0);
+        if resized || (state.alt && !was_alt) {
+            io.delta = state.top - top;
+        } else if state.top > top + io.delta {
+            scroll_up(&mut self.engine, (state.top - top - io.delta) as usize);
+        } else if state.top < top + io.delta {
+            resync = true;
+        }
+        let output = !update.lines.is_empty() || update.bytes > 0;
+        let screen = self.engine.screen_mut();
+        for (row, line) in update.lines {
+            if let Some(phys) = screen.stable_row_to_phys(row - io.delta) {
+                *screen.line_mut(phys) = line;
+            }
+        }
+        if !state.alt && screen.scrollback_rows() != state.held {
+            // The host erased its scrollback.
+            if state.held == usize::from(state.rows) {
+                self.engine.erase_scrollback();
+            }
+            if self.engine.screen().scrollback_rows() != state.held {
+                resync = true;
+            }
+        }
+        sync_cursor(&mut self.engine, &state);
+        self.engine.increment_seqno();
+        if resync && let Some(id) = io.id {
+            io.link.send(HubMsg::Resync(id));
+        }
+        if update.bytes > 0 {
+            self.output.record(now, update.bytes);
+        }
+        let display = self.apply_meta(update.meta, now);
+        RemoteChange {
+            output,
+            bell: update.bell,
+            display,
+        }
+    }
+
+    /// Returns whether the tab bar changes.
+    fn apply_meta(&mut self, meta: TabMeta, now: Instant) -> bool {
+        let mut changed = false;
+        if meta.name != self.name {
+            self.name = meta.name.clone();
+            changed = true;
+        }
+        match (&mut self.agent, &meta.agent) {
+            (Some(tracker), Some(report)) => changed |= tracker.apply_report(report, now),
+            (None, Some(report)) => {
+                self.agent = Some(Tracker::reported(report, now));
+                changed = true;
+            }
+            (Some(_), None) => {
+                self.agent = None;
+                changed = true;
+            }
+            (None, None) => {}
+        }
+        if let Io::Remote(io) = &mut self.io {
+            changed |= io.meta.progress != meta.progress;
+            io.meta = meta;
+        }
+        changed
+    }
+
+    /// How a host knows this tab.
+    pub fn wire(&self) -> Option<TabRef> {
+        match &self.io {
+            Io::Remote(io) => Some(io.wire),
+            Io::Local { .. } => None,
+        }
+    }
+
+    pub fn remote_id(&self) -> Option<RemoteTabId> {
+        match &self.io {
+            Io::Remote(io) => io.id,
+            Io::Local { .. } => None,
+        }
+    }
+
+    pub fn key_down(&mut self, code: KeyCode, mods: Modifiers) {
+        match &self.io {
+            Io::Local { .. } => {
+                let _ = self.engine.key_down(code, mods);
+            }
+            Io::Remote(io) => io.link.send(HubMsg::Key {
+                tab: io.wire,
+                code,
+                mods,
+            }),
+        }
+    }
+
+    pub fn send_paste(&mut self, text: &str) {
+        match &self.io {
+            Io::Local { .. } => {
+                let _ = self.engine.send_paste(text);
+            }
+            Io::Remote(io) => io.link.send(HubMsg::Paste {
+                tab: io.wire,
+                text: text.to_string(),
+            }),
+        }
+    }
+
+    pub fn mouse_event(&mut self, event: MouseEvent) {
+        match &self.io {
+            Io::Local { .. } => {
+                let _ = self.engine.mouse_event(event);
+            }
+            Io::Remote(io) => io.link.send(HubMsg::Mouse {
+                tab: io.wire,
+                event,
+            }),
+        }
+    }
+
+    pub fn mouse_grabbed(&self) -> bool {
+        match &self.io {
+            Io::Local { .. } => self.engine.is_mouse_grabbed(),
+            Io::Remote(io) => io.meta.mouse_grabbed,
+        }
+    }
+
+    /// A host hears of it too, so its report stops showing done.
+    pub fn mark_seen(&mut self) {
+        let Some(tracker) = &mut self.agent else {
+            return;
+        };
+        if tracker.mark_seen()
+            && let Io::Remote(io) = &self.io
+        {
+            io.link.send(HubMsg::Seen(io.wire));
+        }
+    }
+
+    /// Output and bell for an adopting hub to show as activity.
+    pub fn note_unsent(&mut self, len: usize, bell: bool) {
+        self.unsent_bytes = self.unsent_bytes.saturating_add(len);
+        self.unsent_bell |= bell;
+    }
+
+    fn wire_meta(&self, now: Instant) -> TabMeta {
+        TabMeta {
+            name: self.name.clone(),
+            progress: self.progress(),
+            mouse_grabbed: self.mouse_grabbed(),
+            agent: self.agent.as_ref().map(|t| t.report(now)),
+        }
+    }
+
+    fn wire_screen(&self) -> ScreenState {
+        let screen = self.engine.screen();
+        let size = self.engine.get_size();
+        let cursor = self.engine.cursor_pos();
+        ScreenState {
+            cols: size.cols as u16,
+            rows: size.rows as u16,
+            alt: self.engine.is_alt_screen_active(),
+            top: screen.visible_row_to_stable_row(0),
+            held: screen.scrollback_rows(),
+            cursor_x: cursor.x,
+            cursor_y: cursor.y,
+            cursor_visible: cursor.visibility == termwiz::surface::CursorVisibility::Visible,
+        }
+    }
+
+    /// The whole tab for a hub, and the baseline for later updates.
+    pub fn wire_snapshot(&mut self, now: Instant) -> (TabSnap, Synced) {
+        let screen = self.engine.screen();
+        let lines = screen.lines_in_phys_range(0..screen.scrollback_rows());
+        let synced = Synced {
+            seqno: self.engine.current_seqno(),
+            screen: self.wire_screen(),
+            meta: self.wire_meta(now),
+        };
+        self.unsent_bytes = 0;
+        self.unsent_bell = false;
+        let snap = TabSnap {
+            id: self.id,
+            meta: synced.meta.clone(),
+            screen: synced.screen,
+            lines,
+        };
+        (snap, synced)
+    }
+
+    /// What changed since `synced`, or `None` when nothing did.
+    pub fn wire_update(&mut self, synced: &mut Synced, now: Instant) -> Option<TabUpdate> {
+        let seqno = self.engine.current_seqno();
+        let state = self.wire_screen();
+        let meta = self.wire_meta(now);
+        if seqno == synced.seqno
+            && state == synced.screen
+            && meta.same(&synced.meta)
+            && self.unsent_bytes == 0
+            && !self.unsent_bell
+        {
+            return None;
+        }
+        let screen = self.engine.screen();
+        let bottom = state.top + state.rows as isize;
+        let reshaped = state.alt != synced.screen.alt
+            || state.cols != synced.screen.cols
+            || state.rows != synced.screen.rows;
+        let rows: Vec<isize> = if reshaped {
+            (state.top..bottom).collect()
+        } else {
+            // Rows that scrolled into history since the last update may
+            // have changed on the way.
+            let oldest = screen.phys_to_stable_row_index(0);
+            let from = synced.screen.top.min(state.top).max(oldest);
+            screen.get_changed_stable_rows(from..bottom, synced.seqno)
+        };
+        let lines = rows
+            .into_iter()
+            .filter_map(|row| {
+                let phys = screen.stable_row_to_phys(row)?;
+                Some((row, screen.lines_in_phys_range(phys..phys + 1).pop()?))
+            })
+            .collect();
+        let update = TabUpdate {
+            meta: meta.clone(),
+            screen: state,
+            lines,
+            bytes: std::mem::take(&mut self.unsent_bytes),
+            bell: std::mem::take(&mut self.unsent_bell),
+        };
+        *synced = Synced {
+            seqno,
+            screen: state,
+            meta,
+        };
+        Some(update)
     }
 
     pub fn note_output(&mut self, len: usize, now: Instant) {
@@ -555,6 +976,9 @@ impl Tab {
 
     /// The percentage the program last reported through OSC 9;4.
     pub fn progress(&self) -> Option<u8> {
+        if let Io::Remote(io) = &self.io {
+            return io.meta.progress;
+        }
         match self.engine.get_progress() {
             Progress::Percentage(p) | Progress::Error(p) => Some(p.min(100)),
             Progress::None | Progress::Indeterminate => None,
@@ -576,16 +1000,33 @@ impl Tab {
 
     /// Removal follows once the PTY closes, like any other exit.
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
+        match &mut self.io {
+            Io::Local { child, .. } => {
+                let _ = child.kill();
+            }
+            Io::Remote(io) => io.link.send(HubMsg::Kill(io.wire)),
+        }
     }
 
     pub fn set_name(&mut self, name: String) {
+        if let Io::Remote(io) = &self.io {
+            io.link.send(HubMsg::SetName {
+                tab: io.wire,
+                name: Some(name.clone()),
+            });
+        }
         self.name = name;
         self.manual_name = true;
     }
 
     pub fn clear_name(&mut self, osc_titles: OscTitles) {
         self.manual_name = false;
+        if let Io::Remote(io) = &self.io {
+            io.link.send(HubMsg::SetName {
+                tab: io.wire,
+                name: None,
+            });
+        }
         // Don't wait for the next PTY output to trigger refresh_identity.
         if let Some(fg) = self.foreground() {
             let name = self.derived_name(&fg, osc_titles);
@@ -683,14 +1124,22 @@ impl Tab {
             AgentState::Working | AgentState::Waiting => return None,
         };
         Some(Notice {
+            id: self.id,
             tab: self.name.clone(),
             blocked,
             summary: self.notify_text.lock().unwrap().take(),
         })
     }
 
+    fn process_group_leader(&self) -> Option<i32> {
+        match &self.io {
+            Io::Local { master, .. } => master.process_group_leader(),
+            Io::Remote(_) => None,
+        }
+    }
+
     fn foreground(&self) -> Option<Foreground> {
-        let pid = self.master.process_group_leader()?;
+        let pid = self.process_group_leader()?;
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
         let argv: Vec<String> = cmdline
@@ -713,7 +1162,7 @@ impl Tab {
 
     /// The session file Claude Code keeps for its own pid.
     fn claude_session_file(&self) -> Option<serde_json::Value> {
-        let pid = self.master.process_group_leader()?;
+        let pid = self.process_group_leader()?;
         let home = std::env::var_os("HOME")?;
         let path = std::path::PathBuf::from(home)
             .join(".claude/sessions")
@@ -742,7 +1191,7 @@ impl Tab {
     }
 
     pub fn working_dir(&self) -> Option<std::path::PathBuf> {
-        let pid = self.master.process_group_leader()?;
+        let pid = self.process_group_leader()?;
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
@@ -854,18 +1303,75 @@ impl Tab {
         }
     }
 
+    /// A remote tab's mirror follows once its host has resized.
     pub fn resize(&mut self, rect: Rect) {
         self.rect = rect;
-        let _ = self.master.resize(pty_size(rect));
-        self.engine.resize(term_size(rect));
+        match &mut self.io {
+            Io::Local { master, .. } => {
+                let _ = master.resize(pty_size(rect));
+                self.engine.resize(term_size(rect));
+            }
+            Io::Remote(io) => {
+                let size = (rect.width.max(1), rect.height.max(1));
+                if io.requested != size {
+                    io.requested = size;
+                    io.link.send(HubMsg::Resize {
+                        tab: io.wire,
+                        cols: size.0,
+                        rows: size.1,
+                    });
+                }
+            }
+        }
     }
 
     pub fn wait(&mut self) -> i32 {
-        match self.child.wait() {
+        let Io::Local { child, .. } = &mut self.io else {
+            return 0;
+        };
+        match child.wait() {
             Ok(status) => status.exit_code() as i32,
             Err(_) => 0,
         }
     }
+}
+
+/// Writes nowhere: the host's own engine answers the program.
+fn mirror_engine(cols: u16, rows: u16) -> Engine {
+    Engine::new(
+        term_size(Rect::new(0, 0, cols, rows)),
+        Arc::new(LuxConfig),
+        "lux",
+        env!("CARGO_PKG_VERSION"),
+        Box::new(std::io::sink()),
+    )
+}
+
+/// Pushes `count` blank rows in at the bottom, moving the top rows into
+/// history.
+fn scroll_up(engine: &mut Engine, mut count: usize) {
+    let rows = engine.screen().physical_rows;
+    let seqno = engine.current_seqno();
+    while count > 0 {
+        let step = count.min(rows);
+        engine.screen_mut().scroll_up(
+            &(0..rows as i64),
+            step,
+            seqno,
+            CellAttributes::default(),
+            LuxConfig.bidi_mode(),
+        );
+        count -= step;
+    }
+}
+
+fn sync_cursor(engine: &mut Engine, state: &ScreenState) {
+    let visibility = if state.cursor_visible { 'h' } else { 'l' };
+    engine.advance_bytes(format!(
+        "\x1b[{};{}H\x1b[?25{visibility}",
+        state.cursor_y + 1,
+        state.cursor_x + 1
+    ));
 }
 
 /// Session name, then the OSC title where the scope allows it, then the
@@ -1279,6 +1785,212 @@ mod tests {
         output.record(start + Duration::from_millis(1000), 65536);
         let phase = output.advance(start + Duration::from_millis(1500), true);
         assert!((phase - 0.75).abs() < 0.01, "phase {phase}");
+    }
+
+    /// A local tab whose engine the test feeds directly.
+    fn source_tab(cols: u16, rows: u16) -> Tab {
+        let (tx, _) = std::sync::mpsc::channel();
+        Tab::spawn_argv(Rect::new(0, 0, cols, rows), None, &["sleep", "30"], tx).unwrap()
+    }
+
+    fn all_text(engine: &Engine) -> Vec<String> {
+        let screen = engine.screen();
+        screen
+            .lines_in_phys_range(0..screen.scrollback_rows())
+            .iter()
+            .map(|line| line.as_str().trim_end().to_string())
+            .collect()
+    }
+
+    fn visible_text(engine: &Engine) -> Vec<String> {
+        let screen = engine.screen();
+        let rows = screen.physical_rows as i64;
+        screen
+            .lines_in_phys_range(screen.phys_range(&(0..rows)))
+            .iter()
+            .map(|line| line.as_str().trim_end().to_string())
+            .collect()
+    }
+
+    fn assert_mirrors(mirror: &Tab, source: &Tab) {
+        assert_eq!(all_text(&mirror.engine), all_text(&source.engine));
+        let (m, s) = (mirror.engine.cursor_pos(), source.engine.cursor_pos());
+        assert_eq!((m.x, m.y, m.visibility), (s.x, s.y, s.visibility));
+        assert_eq!(
+            mirror.engine.is_alt_screen_active(),
+            source.engine.is_alt_screen_active()
+        );
+    }
+
+    fn sync(source: &mut Tab, synced: &mut Synced, mirror: &mut Tab) {
+        let now = Instant::now();
+        if let Some(update) = source.wire_update(synced, now) {
+            mirror.apply_remote(update, now);
+        }
+    }
+
+    #[test]
+    fn a_mirror_matches_its_source_through_scrolling_output() {
+        let now = Instant::now();
+        let mut source = source_tab(40, 6);
+        for i in 0..50 {
+            source.engine.advance_bytes(format!("line {i}\r\n"));
+        }
+        let (snap, mut synced) = source.wire_snapshot(now);
+        let mut mirror = Tab::from_remote(HostLink::default(), snap, now);
+        assert_mirrors(&mirror, &source);
+
+        for i in 50..120 {
+            source
+                .engine
+                .advance_bytes(format!("\x1b[1mmore\x1b[0m {i}\r\n"));
+        }
+        source.engine.advance_bytes(b"partial");
+        sync(&mut source, &mut synced, &mut mirror);
+        assert_mirrors(&mirror, &source);
+
+        // A rewrite in place, with nothing scrolling.
+        source
+            .engine
+            .advance_bytes(b"\r\x1b[2Kreplaced\x1b[3;1Hmiddle");
+        sync(&mut source, &mut synced, &mut mirror);
+        assert_mirrors(&mirror, &source);
+        source.kill();
+    }
+
+    #[test]
+    fn a_mirror_matches_its_source_past_the_scrollback_limit() {
+        let now = Instant::now();
+        let mut source = source_tab(20, 5);
+        let (snap, mut synced) = source.wire_snapshot(now);
+        let mut mirror = Tab::from_remote(HostLink::default(), snap, now);
+        for batch in 0..10 {
+            for i in 0..800 {
+                source.engine.advance_bytes(format!("{batch}-{i}\r\n"));
+            }
+            sync(&mut source, &mut synced, &mut mirror);
+        }
+        assert_mirrors(&mirror, &source);
+        source.kill();
+    }
+
+    #[test]
+    fn a_mirror_follows_the_alternate_screen_and_back() {
+        let now = Instant::now();
+        let mut source = source_tab(30, 5);
+        for i in 0..20 {
+            source.engine.advance_bytes(format!("shell {i}\r\n"));
+        }
+        let (snap, mut synced) = source.wire_snapshot(now);
+        let mut mirror = Tab::from_remote(HostLink::default(), snap, now);
+
+        source
+            .engine
+            .advance_bytes(b"\x1b[?1049h\x1b[H\x1b[2Jeditor\x1b[?25l");
+        sync(&mut source, &mut synced, &mut mirror);
+        assert_mirrors(&mirror, &source);
+
+        source.engine.advance_bytes(b"\x1b[?1049l\x1b[?25hback\r\n");
+        sync(&mut source, &mut synced, &mut mirror);
+        assert_mirrors(&mirror, &source);
+        source.kill();
+    }
+
+    #[test]
+    fn a_snapshot_taken_on_the_alternate_screen_asks_for_the_primary_later() {
+        let now = Instant::now();
+        let mut source = source_tab(30, 5);
+        source
+            .engine
+            .advance_bytes(b"history\r\n\x1b[?1049hfull screen");
+        let (snap, mut synced) = source.wire_snapshot(now);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut mirror = Tab::from_remote(HostLink::connected_to(tx), snap, now);
+        assert_mirrors(&mirror, &source);
+
+        source.engine.advance_bytes(b"\x1b[?1049l");
+        sync(&mut source, &mut synced, &mut mirror);
+        assert!(matches!(rx.try_recv(), Ok(HubMsg::Resync(id)) if id == source.id));
+        let (snap, _) = source.wire_snapshot(now);
+        mirror.load_remote(snap, now);
+        assert_mirrors(&mirror, &source);
+        source.kill();
+    }
+
+    #[test]
+    fn a_mirror_drops_scrollback_the_source_erased() {
+        let now = Instant::now();
+        let mut source = source_tab(30, 5);
+        for i in 0..40 {
+            source.engine.advance_bytes(format!("old {i}\r\n"));
+        }
+        let (snap, mut synced) = source.wire_snapshot(now);
+        let mut mirror = Tab::from_remote(HostLink::default(), snap, now);
+        source.engine.advance_bytes(b"\x1b[H\x1b[2J\x1b[3Jclean");
+        sync(&mut source, &mut synced, &mut mirror);
+        assert_mirrors(&mirror, &source);
+        source.kill();
+    }
+
+    #[test]
+    fn a_mirror_follows_its_source_through_a_resize() {
+        let now = Instant::now();
+        let mut source = source_tab(40, 6);
+        for i in 0..30 {
+            source
+                .engine
+                .advance_bytes(format!("a fairly long line number {i} that wraps\r\n"));
+        }
+        let (snap, mut synced) = source.wire_snapshot(now);
+        let mut mirror = Tab::from_remote(HostLink::default(), snap, now);
+        source.resize(Rect::new(0, 0, 25, 8));
+        sync(&mut source, &mut synced, &mut mirror);
+        assert_eq!(visible_text(&mirror.engine), visible_text(&source.engine));
+        assert_mirrors(&mirror, &source);
+        source.kill();
+    }
+
+    #[test]
+    fn a_remote_tab_sends_input_to_its_host_instead_of_its_mirror() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tab =
+            Tab::remote_placeholder(HostLink::connected_to(tx), 9, Rect::new(0, 0, 10, 3));
+        tab.key_down(KeyCode::Char('x'), Modifiers::NONE);
+        tab.send_paste("hi");
+        tab.resize(Rect::new(0, 0, 12, 4));
+        tab.resize(Rect::new(0, 0, 12, 4));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HubMsg::Key {
+                tab: TabRef::Token(9),
+                code: KeyCode::Char('x'),
+                ..
+            })
+        ));
+        assert!(matches!(rx.try_recv(), Ok(HubMsg::Paste { text, .. }) if text == "hi"));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(HubMsg::Resize {
+                cols: 12,
+                rows: 4,
+                ..
+            })
+        ));
+        assert!(rx.try_recv().is_err());
+        // The mirror resizes only once the host has.
+        assert_eq!(tab.engine.get_size().cols, 10);
+    }
+
+    #[test]
+    fn a_disconnected_link_drops_input() {
+        let mut tab = Tab::remote_placeholder(HostLink::default(), 1, Rect::new(0, 0, 10, 3));
+        tab.key_down(KeyCode::Char('x'), Modifiers::NONE);
+        assert!(
+            tab.engine.screen().lines_in_phys_range(0..1)[0]
+                .as_str()
+                .trim()
+                .is_empty()
+        );
     }
 
     #[test]

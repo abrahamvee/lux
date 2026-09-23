@@ -6,14 +6,16 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use wezterm_term::{Progress, Terminal as Engine};
 
 use crate::server::anim::Anim;
+use crate::server::wire::AgentReport;
 
 /// How long an idle result must hold before the tab shows idle.
 pub const IDLE_DEBOUNCE: Duration = Duration::from_millis(400);
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum AgentState {
     Idle,
     Working,
@@ -23,7 +25,7 @@ pub enum AgentState {
     Blocked,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum AgentKind {
     Claude,
     Codex,
@@ -512,6 +514,35 @@ impl Tracker {
         }
     }
 
+    /// Shows what a host reported, with no debounce of its own.
+    pub fn reported(report: &AgentReport, now: Instant) -> Self {
+        let mut tracker = Self::new(report.kind);
+        tracker.apply_report(report, now);
+        tracker
+    }
+
+    pub fn report(&self, now: Instant) -> AgentReport {
+        AgentReport {
+            kind: self.kind,
+            state: self.displayed,
+            held_ms: now.duration_since(self.since).as_millis() as u64,
+            seen: self.seen,
+        }
+    }
+
+    /// Returns whether the display changed.
+    pub fn apply_report(&mut self, report: &AgentReport, now: Instant) -> bool {
+        let changed = self.displayed != report.state || self.seen != report.seen;
+        self.kind = report.kind;
+        self.displayed = report.state;
+        self.since = now
+            .checked_sub(Duration::from_millis(report.held_ms))
+            .unwrap_or(now);
+        self.pending_idle = None;
+        self.seen = report.seen;
+        changed
+    }
+
     pub fn kind(&self) -> AgentKind {
         self.kind
     }
@@ -565,8 +596,9 @@ impl Tracker {
         self.pending_idle.is_some()
     }
 
-    pub fn mark_seen(&mut self) {
-        self.seen = true;
+    /// Returns whether the tab was unseen.
+    pub fn mark_seen(&mut self) -> bool {
+        !std::mem::replace(&mut self.seen, true)
     }
 
     /// Working or waiting: the agent or its background work is still going.

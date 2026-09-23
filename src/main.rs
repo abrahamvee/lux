@@ -44,6 +44,7 @@ fn main() {
         [] => client::attach(Request::New),
         ["-s", name] | ["-t", name] => client::attach(Request::Session((*name).into())),
         ["__server"] => server::run(),
+        ["proxy"] => client::proxy(),
         [verb, rest @ ..] => match (resolve(verb), rest) {
             (Some("new-session"), []) => client::attach(Request::New),
             (Some("new-session"), ["-s", name]) => client::attach(Request::Session((*name).into())),

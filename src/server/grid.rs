@@ -43,11 +43,12 @@ pub struct GridItem {
     pub tab: usize,
 }
 
-/// Every agent tab in a stable order, so a tile stays put as unrelated
-/// tabs change.
+/// Every local agent tab in a stable order, so a tile stays put as
+/// unrelated tabs change.
 pub fn items(sessions: &BTreeMap<SessionId, Session>) -> Vec<GridItem> {
     let mut by_name: Vec<(&str, SessionId)> = sessions
         .iter()
+        .filter(|(_, s)| !s.is_remote())
         .map(|(&sid, s)| (s.name.as_str(), sid))
         .collect();
     by_name.sort();

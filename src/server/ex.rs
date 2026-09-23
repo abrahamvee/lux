@@ -5,6 +5,8 @@ use std::path::PathBuf;
 pub const COMMANDS: &[&str] = &[
     "config-open",
     "config-reload",
+    "connect",
+    "disconnect",
     "kill-session",
     "new",
     "new-session",
@@ -28,6 +30,9 @@ pub enum ExCommand {
     ConfigOpen,
     /// Re-read the config file and apply it to every session.
     ConfigReload,
+    /// Adopt the sessions of the host at this ssh alias.
+    Connect(String),
+    Disconnect(String),
 }
 
 pub fn parse(text: &str) -> Option<ExCommand> {
@@ -47,6 +52,12 @@ pub fn parse(text: &str) -> Option<ExCommand> {
             }
             if let Some(name) = arg(text, "kill-session") {
                 return Some(ExCommand::KillSession(Some(name.to_string())));
+            }
+            if let Some(alias) = arg(text, "connect") {
+                return Some(ExCommand::Connect(alias.to_string()));
+            }
+            if let Some(alias) = arg(text, "disconnect") {
+                return Some(ExCommand::Disconnect(alias.to_string()));
             }
             let path = text.strip_prefix("w ")?.trim();
             if path.is_empty() {
@@ -104,6 +115,17 @@ mod tests {
     }
 
     #[test]
+    fn connect_and_disconnect_take_an_alias() {
+        assert_eq!(parse("connect dev"), Some(ExCommand::Connect("dev".into())));
+        assert_eq!(
+            parse("disconnect dev"),
+            Some(ExCommand::Disconnect("dev".into()))
+        );
+        assert_eq!(parse("connect"), None);
+        assert_eq!(parse("disconnect "), None);
+    }
+
+    #[test]
     fn unrecognized_text_parses_to_none() {
         assert_eq!(parse(""), None);
         assert_eq!(parse("vsp"), None);
@@ -125,6 +147,8 @@ mod tests {
             vec![
                 "config-open",
                 "config-reload",
+                "connect",
+                "disconnect",
                 "kill-session",
                 "new",
                 "new-session",

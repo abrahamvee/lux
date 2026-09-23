@@ -10,6 +10,8 @@ anyhow = "1"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 # For OSC 52 clipboard payloads.
 base64 = "0.22"
+# Remote-host protocol frames.
+bincode = "1.3"
 # Local wall-clock for the session status line.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ratatui = "0.30"
@@ -37,6 +39,7 @@ ratatui-textarea = "0.9"
 toml = { version = "1", features = ["preserve_order"] }
 # wezterm crates pinned to a single commit; termwiz must be
 # the same rev because its types appear in wezterm-term's public API.
+# use_serde: screen lines and input events cross the remote-host protocol.
 portable-pty = { git = "https://github.com/wezterm/wezterm", rev = "4fbd6b8e90e2326b8e25c589768f98bd71ddd047" }
-termwiz = { git = "https://github.com/wezterm/wezterm", rev = "4fbd6b8e90e2326b8e25c589768f98bd71ddd047" }
-wezterm-term = { git = "https://github.com/wezterm/wezterm", rev = "4fbd6b8e90e2326b8e25c589768f98bd71ddd047" }
+termwiz = { git = "https://github.com/wezterm/wezterm", rev = "4fbd6b8e90e2326b8e25c589768f98bd71ddd047", features = ["use_serde"] }
+wezterm-term = { git = "https://github.com/wezterm/wezterm", rev = "4fbd6b8e90e2326b8e25c589768f98bd71ddd047", features = ["use_serde"] }

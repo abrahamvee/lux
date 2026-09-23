@@ -21,6 +21,9 @@ pub enum Request {
     Kill,
     KillSession(String),
     Resize,
+    /// Hand the stream to an adopting hub's frames once the server
+    /// answers `ok`.
+    Proxy,
 }
 
 impl Request {
@@ -33,6 +36,7 @@ impl Request {
             Request::Kill => "kill\n".into(),
             Request::KillSession(name) => format!("kill-session {name}\n"),
             Request::Resize => "resize\n".into(),
+            Request::Proxy => "proxy\n".into(),
         }
     }
 
@@ -47,6 +51,7 @@ impl Request {
                 "ls" => Request::Ls,
                 "kill" => Request::Kill,
                 "resize" => Request::Resize,
+                "proxy" => Request::Proxy,
                 _ => return None,
             },
             _ => return None,

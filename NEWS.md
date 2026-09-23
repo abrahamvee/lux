@@ -2,6 +2,8 @@
 
 ## 2026-09-22
 
+- `:connect <ssh-alias>` adopts another host's lux sessions over ssh, listing
+  them in the switcher tagged by host and running them like local ones.
 - The switcher's highlighted row keeps its animated agent-status color
   instead of showing the terminal's default foreground.
 

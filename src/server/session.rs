@@ -26,6 +26,7 @@ use crate::server::agent;
 use crate::server::anim::{self, Anim};
 use crate::server::config::{self, Config};
 use crate::server::ex::{self, ExCommand};
+use crate::server::host::{self, HostId, HostLink};
 use crate::server::input;
 use crate::server::keys::{Command, KeyMatch, KeyTrie};
 use crate::server::layout::{self, Dir, Node, Separator, Side, SplitKind, WindowId};
@@ -33,7 +34,12 @@ use crate::server::palette::{self, Palette};
 use crate::server::persist;
 use crate::server::term::FdBackend;
 use crate::server::transition::{Transitions, Zoom};
-use crate::server::window::{Activity, LastOutput, Notice, Tab, TabId, Window};
+use crate::server::window::{
+    Activity, LastOutput, Notice, Synced, Tab, TabId, Window, content_rect,
+};
+use crate::server::wire::{
+    HubMsg, LayoutSnap, RemoteSessionId, SessionSnap, TabRef, TabUpdate, WindowLayout, WindowSnap,
+};
 use crate::server::{ServerEvent, SessionId};
 
 /// Minimum window size.
@@ -59,6 +65,9 @@ pub enum Effect {
     KillSession(Option<String>),
     /// Re-read the config file and apply it to every session.
     ReloadConfig,
+    /// Adopt a host's sessions by ssh alias.
+    Connect(String),
+    Disconnect(String),
     Copy(String),
     Paste,
     /// Mouse pointer shape, as an OSC 22 name.
@@ -133,7 +142,7 @@ fn forward_mouse(tab: &mut Tab, mouse: &CtMouseEvent, content: Rect) {
         CtMouseKind::ScrollLeft | CtMouseKind::ScrollRight => return,
     };
     let (x, y) = clamp_to_content(Position::new(mouse.column, mouse.row), content);
-    let _ = tab.engine.mouse_event(wezterm_term::MouseEvent {
+    tab.mouse_event(wezterm_term::MouseEvent {
         kind,
         x: x as usize,
         y: y as i64,
@@ -208,6 +217,10 @@ static HOSTNAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         .to_string_lossy()
         .into_owned()
 });
+
+pub fn hostname() -> &'static str {
+    &HOSTNAME
+}
 
 /// Status-line pointer to an agent tab that finished or got blocked unseen,
 /// possibly in another session.
@@ -324,6 +337,25 @@ pub struct Session {
     force_redraw: bool,
     transitions: Transitions,
     tx: Sender<ServerEvent>,
+    /// Where the session runs when it isn't on this server.
+    pub host: Option<SessionHost>,
+    /// Set by the server each render pass while the session's host is
+    /// unreachable.
+    offline: bool,
+    /// Set by the server each render pass: the alias of a host whose
+    /// snapshot is on its way.
+    connecting: Option<String>,
+}
+
+/// A session on a connected host.
+pub struct SessionHost {
+    pub id: HostId,
+    pub link: HostLink,
+    pub remote: RemoteSessionId,
+    /// The alias, cut to the switcher tag's width.
+    pub tag: String,
+    /// The layout the host last heard of.
+    pub synced: Option<LayoutSnap>,
 }
 
 impl Session {
@@ -333,7 +365,9 @@ impl Session {
         config: Arc<Config>,
         tx: Sender<ServerEvent>,
     ) -> anyhow::Result<Self> {
-        let first = Window::new(0, tree_area(area), tx.clone())?;
+        let rect = tree_area(area);
+        let tab = Tab::spawn(content_rect(rect), None, tx.clone())?;
+        let first = Window::with_tab(0, rect, tab);
         let mut windows = HashMap::new();
         windows.insert(first.id, first);
         Ok(Self {
@@ -363,6 +397,9 @@ impl Session {
             force_redraw: true,
             transitions: Transitions::default(),
             tx,
+            host: None,
+            offline: false,
+            connecting: None,
         })
     }
 
@@ -432,7 +469,218 @@ impl Session {
             force_redraw: true,
             transitions: Transitions::default(),
             tx,
+            host: None,
+            offline: false,
+            connecting: None,
         })
+    }
+
+    /// Windows and tree leaves without a counterpart drop out. `None` when
+    /// no window is left.
+    pub fn from_remote(
+        snap: SessionSnap,
+        host: SessionHost,
+        area: Rect,
+        config: Arc<Config>,
+        tx: Sender<ServerEvent>,
+        now: Instant,
+    ) -> Option<Self> {
+        let mut windows = HashMap::new();
+        for wsnap in snap.windows {
+            let tabs: Vec<Tab> = wsnap
+                .tabs
+                .into_iter()
+                .map(|t| Tab::from_remote(host.link.clone(), t, now))
+                .collect();
+            if tabs.is_empty() {
+                continue;
+            }
+            let active = wsnap.active.min(tabs.len() - 1);
+            windows.insert(
+                wsnap.id,
+                Window {
+                    id: wsnap.id,
+                    rect: Rect::default(),
+                    tabs,
+                    active,
+                },
+            );
+        }
+        let (tree, minimized, focus) = arrange(&snap.tree, &snap.minimized, snap.focus, &windows)?;
+        let next_window_id = windows.keys().max().copied().unwrap_or(0) + 1;
+        Some(Self {
+            name: snap.name,
+            tree,
+            windows,
+            focus,
+            chord: None,
+            resize_repeat: None,
+            move_repeat: None,
+            send_prefix_repeat: None,
+            maximized: None,
+            minimized,
+            hover: None,
+            prompt: None,
+            config,
+            message: None,
+            selection: None,
+            border_drag: None,
+            indicator: None,
+            yanked: Vec::new(),
+            term_colors: palette::TermColors::default(),
+            view: View::default(),
+            area,
+            clock: String::new(),
+            next_window_id,
+            force_redraw: true,
+            transitions: Transitions::default(),
+            tx,
+            host: Some(host),
+            offline: false,
+            connecting: None,
+        })
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// The whole session for an adopting hub, plus each tab's sync
+    /// baseline.
+    pub fn remote_snapshot(
+        &mut self,
+        id: RemoteSessionId,
+        now: Instant,
+    ) -> (SessionSnap, Vec<(TabId, Synced)>) {
+        let mut synced = Vec::new();
+        let mut windows = Vec::new();
+        for id in self.window_order() {
+            let Some(win) = self.windows.get_mut(&id) else {
+                continue;
+            };
+            let tabs = win
+                .tabs
+                .iter_mut()
+                .map(|tab| {
+                    let (snap, base) = tab.wire_snapshot(now);
+                    synced.push((tab.id, base));
+                    snap
+                })
+                .collect();
+            windows.push(WindowSnap {
+                id,
+                active: win.active,
+                tabs,
+            });
+        }
+        let snap = SessionSnap {
+            id,
+            name: self.name.clone(),
+            tree: persist::capture_node(&self.tree),
+            windows,
+            minimized: self.minimized.clone(),
+            focus: self.focus,
+        };
+        (snap, synced)
+    }
+
+    /// The layout as its host knows it. `None` while any tab has no
+    /// address on the host.
+    pub fn layout_snap(&self) -> Option<LayoutSnap> {
+        let mut windows = Vec::new();
+        for id in self.window_order() {
+            let win = self.windows.get(&id)?;
+            let tabs = win.tabs.iter().map(Tab::wire).collect::<Option<_>>()?;
+            windows.push(WindowLayout {
+                id,
+                active: win.active,
+                tabs,
+            });
+        }
+        Some(LayoutSnap {
+            tree: persist::capture_node(&self.tree),
+            windows,
+            minimized: self.minimized.clone(),
+            focus: self.focus,
+        })
+    }
+
+    /// Rebuilds the windows from a hub's layout. `pool` holds tabs the
+    /// layout moved here from other sessions. Tabs of this session the
+    /// layout leaves out stay alive in the focused window. Returns whether
+    /// any tab is left.
+    pub fn relayout(
+        &mut self,
+        layout: &LayoutSnap,
+        resolve: impl Fn(TabRef) -> Option<TabId>,
+        mut pool: HashMap<TabId, Tab>,
+    ) -> bool {
+        let mut own = Vec::new();
+        let mut rects = HashMap::new();
+        for (id, win) in self.windows.drain() {
+            rects.insert(id, win.rect);
+            for tab in win.tabs {
+                own.push(tab.id);
+                pool.insert(tab.id, tab);
+            }
+        }
+        for wl in &layout.windows {
+            let tabs: Vec<Tab> = wl
+                .tabs
+                .iter()
+                .filter_map(|&r| pool.remove(&resolve(r)?))
+                .collect();
+            if tabs.is_empty() {
+                continue;
+            }
+            let active = wl.active.min(tabs.len() - 1);
+            let rect = rects.get(&wl.id).copied().unwrap_or_default();
+            self.windows.insert(
+                wl.id,
+                Window {
+                    id: wl.id,
+                    rect,
+                    tabs,
+                    active,
+                },
+            );
+        }
+        let left: Vec<Tab> = own.iter().filter_map(|id| pool.remove(id)).collect();
+        let arranged = arrange(&layout.tree, &layout.minimized, layout.focus, &self.windows);
+        match arranged {
+            Some((tree, minimized, focus)) => {
+                self.tree = tree;
+                self.minimized = minimized;
+                self.focus = focus;
+            }
+            None => {
+                let Some(first) = left.first() else {
+                    return false;
+                };
+                let id = self.windows.keys().max().map_or(0, |id| id + 1);
+                let rect = first.rect;
+                self.windows.insert(
+                    id,
+                    Window {
+                        id,
+                        rect,
+                        tabs: Vec::new(),
+                        active: 0,
+                    },
+                );
+                self.tree = Node::Leaf(id);
+                self.minimized.clear();
+                self.focus = id;
+            }
+        }
+        if let Some(win) = self.windows.get_mut(&self.focus) {
+            win.tabs.extend(left);
+        }
+        self.next_window_id = self.windows.keys().max().copied().unwrap_or(0) + 1;
+        self.maximized = None;
+        self.selection = None;
+        self.force_redraw = true;
+        true
     }
 
     pub fn snapshot(&mut self) -> persist::SessionSnapshot {
@@ -512,21 +760,54 @@ impl Session {
         tab.note_output(bytes.len(), Instant::now());
         let (mut changed, notice) = tab.refresh_identity(osc_titles);
         let rang = tab.take_bell();
-        if background && tab.agent.is_none() {
-            let mark = match (rang, tab.activity) {
-                (true, _) => Some(Activity::Bell),
-                (false, None) => Some(Activity::Output),
-                (false, Some(_)) => None,
-            };
-            if mark.is_some() && mark != tab.activity {
-                tab.activity = mark;
-                changed = true;
-            }
-        }
+        tab.note_unsent(bytes.len(), rang);
+        changed |= background && mark_activity(tab, rang);
         if changed {
             self.force_redraw = true;
         }
         notice
+    }
+
+    /// Mirrors a host's update, with the same activity marks as local
+    /// output.
+    pub fn remote_update(&mut self, id: TabId, update: TabUpdate, now: Instant) {
+        let Some(win) = self
+            .windows
+            .values_mut()
+            .find(|w| w.tabs.iter().any(|t| t.id == id))
+        else {
+            return;
+        };
+        let background = win.active_tab().id != id;
+        let Some(tab) = win.find_tab_mut(id) else {
+            return;
+        };
+        let change = tab.apply_remote(update, now);
+        let marked =
+            background && (change.output || change.bell) && mark_activity(tab, change.bell);
+        if change.display || marked {
+            self.force_redraw = true;
+        }
+    }
+
+    pub fn find_tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
+        self.windows.values_mut().find_map(|w| w.find_tab_mut(id))
+    }
+
+    pub fn tabs(&self) -> impl Iterator<Item = &Tab> {
+        self.windows.values().flat_map(|w| w.tabs.iter())
+    }
+
+    pub fn tabs_mut(&mut self) -> impl Iterator<Item = &mut Tab> {
+        self.windows.values_mut().flat_map(|w| w.tabs.iter_mut())
+    }
+
+    /// Joins the focused window at its own size, for a hub's layout to
+    /// place.
+    pub fn adopt_tab(&mut self, tab: Tab) {
+        if let Some(win) = self.windows.get_mut(&self.focus) {
+            win.tabs.push(tab);
+        }
     }
 
     pub fn has_pending_idle(&self) -> bool {
@@ -687,6 +968,24 @@ impl Session {
         }
     }
 
+    pub fn set_offline(&mut self, offline: bool) {
+        if self.offline != offline {
+            self.offline = offline;
+            self.force_redraw = true;
+        }
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.offline
+    }
+
+    pub fn set_connecting(&mut self, alias: Option<String>) {
+        if self.connecting != alias {
+            self.connecting = alias;
+            self.force_redraw = true;
+        }
+    }
+
     /// In layout order, then tab order.
     pub fn all_tabs(&self) -> Vec<(WindowId, usize)> {
         let mut out = Vec::new();
@@ -712,7 +1011,7 @@ impl Session {
             && let Some(win) = self.windows.get_mut(&window)
             && let Some(tab) = win.tabs.get_mut(index)
         {
-            let _ = tab.engine.key_down(code, mods);
+            tab.key_down(code, mods);
         }
     }
 
@@ -723,7 +1022,7 @@ impl Session {
         if let Some(win) = self.windows.get_mut(&window)
             && let Some(tab) = win.tabs.get_mut(index)
         {
-            let _ = tab.engine.send_paste(text);
+            tab.send_paste(text);
         }
     }
 
@@ -849,7 +1148,7 @@ impl Session {
         if let Some((code, mods)) = map_key(key)
             && let Some(win) = self.windows.get_mut(&self.focus)
         {
-            let _ = win.active_tab_mut().engine.key_down(code, mods);
+            win.active_tab_mut().key_down(code, mods);
         }
         None
     }
@@ -866,7 +1165,7 @@ impl Session {
         if let Some((code, mods)) = map_key(KeyEvent::new(prefix.code, mods))
             && let Some(win) = self.windows.get_mut(&self.focus)
         {
-            let _ = win.active_tab_mut().engine.key_down(code, mods);
+            win.active_tab_mut().key_down(code, mods);
         }
     }
 
@@ -881,7 +1180,7 @@ impl Session {
             return;
         }
         if let Some(win) = self.windows.get_mut(&self.focus) {
-            let _ = win.active_tab_mut().engine.send_paste(text);
+            win.active_tab_mut().send_paste(text);
         }
     }
 
@@ -946,7 +1245,7 @@ impl Session {
                 let win = self.windows.get_mut(&id).expect("window exists");
                 let content = win.content_rect();
                 let tab = win.active_tab_mut();
-                if tab.engine.is_mouse_grabbed() && !shift {
+                if tab.mouse_grabbed() && !shift {
                     forward_mouse(tab, &mouse, content);
                     return None;
                 }
@@ -989,7 +1288,7 @@ impl Session {
                     let win = self.windows.get_mut(&id).expect("window exists");
                     let content = win.content_rect();
                     let tab = win.active_tab_mut();
-                    if tab.engine.is_mouse_grabbed() && !shift {
+                    if tab.mouse_grabbed() && !shift {
                         forward_mouse(tab, &mouse, content);
                     }
                 }
@@ -1028,7 +1327,7 @@ impl Session {
                 let tab = win.active_tab_mut();
                 // On the alternate screen the engine turns wheel ticks into
                 // arrow keys.
-                if tab.engine.is_mouse_grabbed() || tab.engine.is_alt_screen_active() {
+                if tab.mouse_grabbed() || tab.engine.is_alt_screen_active() {
                     forward_mouse(tab, &mouse, content);
                     return None;
                 }
@@ -1162,6 +1461,11 @@ impl Session {
         (!text.is_empty()).then_some(text)
     }
 
+    #[cfg(test)]
+    pub fn run(&mut self, command: Command) -> Option<Effect> {
+        self.execute(command)
+    }
+
     fn execute(&mut self, command: Command) -> Option<Effect> {
         match command {
             Command::SplitSideBySide => self.split(SplitKind::SideBySide),
@@ -1292,6 +1596,10 @@ impl Session {
                         }
                         Some(ExCommand::ConfigOpen) => self.open_config(),
                         Some(ExCommand::ConfigReload) => return Some(Effect::ReloadConfig),
+                        Some(ExCommand::Connect(alias)) => return Some(Effect::Connect(alias)),
+                        Some(ExCommand::Disconnect(alias)) => {
+                            return Some(Effect::Disconnect(alias));
+                        }
                         None => {}
                     },
                     PromptKind::Rename => {
@@ -1375,11 +1683,11 @@ impl Session {
         }
         let id = self.next_window_id;
         // If the shell can't spawn, keep the current layout.
-        let Ok(win) = Window::new(id, second, self.tx.clone()) else {
+        let Ok(tab) = self.spawn_tab(content_rect(second), None) else {
             return;
         };
         self.next_window_id += 1;
-        self.windows.insert(id, win);
+        self.windows.insert(id, Window::with_tab(id, second, tab));
         layout::split_leaf(&mut self.tree, self.focus, kind, id);
         self.set_focus(id);
         self.force_redraw = true;
@@ -1387,13 +1695,46 @@ impl Session {
 
     fn new_tab(&mut self) {
         let win = &self.windows[&self.focus];
-        let cwd = win.active_tab().working_dir();
-        if let Ok(tab) = Tab::spawn(win.content_rect(), cwd, self.tx.clone()) {
+        let rect = win.content_rect();
+        let beside = win.active_tab().id;
+        if let Ok(tab) = self.spawn_tab(rect, Some(beside)) {
             self.push_tab(tab);
         }
     }
 
+    /// Spawns on the session's host, starting in `beside`'s working
+    /// directory when given.
+    fn spawn_tab(&self, rect: Rect, beside: Option<TabId>) -> anyhow::Result<Tab> {
+        let beside = beside.and_then(|id| {
+            self.windows
+                .values()
+                .find_map(|w| w.tabs.iter().find(|t| t.id == id))
+        });
+        let Some(host) = &self.host else {
+            let cwd = beside.and_then(Tab::working_dir);
+            return Tab::spawn(rect, cwd, self.tx.clone());
+        };
+        if !host.link.connected() {
+            anyhow::bail!("host unreachable");
+        }
+        let token = host::next_token();
+        host.link.send(HubMsg::Spawn {
+            token,
+            session: host.remote,
+            cwd_of: beside.and_then(Tab::wire),
+            cols: rect.width.max(1),
+            rows: rect.height.max(1),
+        });
+        Ok(Tab::remote_placeholder(host.link.clone(), token, rect))
+    }
+
     fn open_config(&mut self) {
+        if self.is_remote() {
+            self.show_message(
+                "config-open edits this host's config, so it needs a local session".into(),
+            );
+            return;
+        }
         let editor = std::env::var("EDITOR").unwrap_or_default();
         let mut argv: Vec<&str> = editor.split_whitespace().collect();
         let fallback = argv.is_empty();
@@ -1887,9 +2228,11 @@ impl Session {
         self.transitions.running()
     }
 
-    /// The indicator always shimmers, so it counts on its own.
+    /// The indicator always shimmers and the connecting spinner always
+    /// turns, so each counts on its own.
     pub fn has_animation(&self) -> bool {
         self.indicator.is_some()
+            || self.connecting.is_some()
             || self.transitions.running()
             || self.windows.values().any(|w| {
                 !self.minimized.contains(&w.id)
@@ -1964,10 +2307,8 @@ impl Session {
             win.rect = rect;
             win.reconcile();
             // The focused tab counts as seen once rendered.
-            if id == self.focus
-                && let Some(tracker) = &mut win.active_tab_mut().agent
-            {
-                tracker.mark_seen();
+            if id == self.focus {
+                win.active_tab_mut().mark_seen();
             }
             let progress = win.active_tab().progress();
             let active = win.active;
@@ -2086,19 +2427,28 @@ impl Session {
                         .x
                         .saturating_add(2 + self.name.chars().count() as u16)
                         .min(row.right());
-                    let indicator = self.indicator.as_ref().and_then(|ind| {
-                        let ind_len = ind.text.chars().count() as u16;
-                        let len = ind_len + 2 + self.clock.chars().count() as u16 + 1;
-                        (row.width >= len).then(|| {
-                            let start = row.right() - len;
-                            (ind.text.clone(), start..start + ind_len)
-                        })
-                    });
+                    // A connect in progress outranks the indicator.
+                    let indicator = self
+                        .indicator
+                        .as_ref()
+                        .filter(|_| self.connecting.is_none())
+                        .and_then(|ind| {
+                            let ind_len = ind.text.chars().count() as u16;
+                            let len = ind_len + 2 + self.clock.chars().count() as u16 + 1;
+                            (row.width >= len).then(|| {
+                                let start = row.right() - len;
+                                (ind.text.clone(), start..start + ind_len)
+                            })
+                        });
+                    let host = match &self.connecting {
+                        Some(alias) => format!("{} {alias}", spinner_frame()),
+                        None => HOSTNAME.clone(),
+                    };
                     StatusChrome {
                         row,
                         name: self.name.clone(),
                         minimized: self.minimized_titles(row, name_end),
-                        host: HOSTNAME.clone(),
+                        host,
                         clock: self.clock.clone(),
                         indicator,
                     }
@@ -2224,6 +2574,10 @@ impl Session {
         }
         for sep in &self.view.separators {
             render_separator(sep, palette, buf);
+        }
+        // What an unreachable host last showed stays, dimmed.
+        if self.offline {
+            palette::shade(buf, tree_area(self.area), palette, colors, palette::DIM);
         }
         transitions.overlay(buf);
         if let Some(status) = &self.view.status {
@@ -2577,12 +2931,80 @@ fn move_repeat_dir(key: KeyEvent) -> Option<Dir> {
     }
 }
 
+/// Marks a background tab's output or bell. Returns whether the mark
+/// changed.
+fn mark_activity(tab: &mut Tab, rang: bool) -> bool {
+    if tab.agent.is_some() {
+        return false;
+    }
+    let mark = match (rang, tab.activity) {
+        (true, _) => Some(Activity::Bell),
+        (false, None) => Some(Activity::Output),
+        (false, Some(_)) => None,
+    };
+    if mark.is_some() && mark != tab.activity {
+        tab.activity = mark;
+        return true;
+    }
+    false
+}
+
+/// A layout's tree cut down to the windows that exist, its minimized
+/// windows likewise, and a focus inside the tree. Windows in neither join
+/// the minimized ones. `None` when no window is left.
+fn arrange(
+    tree: &persist::NodeSnapshot,
+    minimized: &[WindowId],
+    focus: WindowId,
+    windows: &HashMap<WindowId, Window>,
+) -> Option<(Node, Vec<WindowId>, WindowId)> {
+    let leaves = layout::leaves(&persist::restore_node(tree));
+    let mut tree = Some(persist::restore_node(tree));
+    for id in leaves {
+        if !windows.contains_key(&id) {
+            tree = tree.and_then(|t| layout::remove_leaf(t, id));
+        }
+    }
+    let in_tree = tree.as_ref().map(layout::leaves).unwrap_or_default();
+    let mut aside: Vec<WindowId> = Vec::new();
+    for &id in minimized {
+        if windows.contains_key(&id) && !in_tree.contains(&id) && !aside.contains(&id) {
+            aside.push(id);
+        }
+    }
+    let mut stray: Vec<WindowId> = windows
+        .keys()
+        .copied()
+        .filter(|id| !in_tree.contains(id) && !aside.contains(id))
+        .collect();
+    stray.sort();
+    aside.extend(stray);
+    let tree = match tree {
+        Some(tree) => tree,
+        None if aside.is_empty() => return None,
+        None => Node::Leaf(aside.remove(0)),
+    };
+    let leaves = layout::leaves(&tree);
+    let focus = if leaves.contains(&focus) {
+        focus
+    } else {
+        leaves[0]
+    };
+    Some((tree, aside, focus))
+}
+
 /// The viewport minus the status row.
 fn tree_area(area: Rect) -> Rect {
     Rect {
         height: area.height.saturating_sub(1),
         ..area
     }
+}
+
+fn spinner_frame() -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let tick = anim::elapsed().as_millis() / 80;
+    FRAMES[tick as usize % FRAMES.len()]
 }
 
 fn clock_now() -> String {

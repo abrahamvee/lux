@@ -8,16 +8,19 @@ pub mod config;
 pub mod ex;
 pub mod find;
 pub mod grid;
+pub mod host;
 pub mod input;
 pub mod keys;
 pub mod layout;
 pub mod palette;
 pub mod persist;
 pub mod search;
+pub mod serve;
 pub mod session;
 pub mod term;
 pub mod transition;
 pub mod window;
+pub mod wire;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -46,6 +49,7 @@ use anim::Anim;
 use auto::AutoState;
 use config::Config;
 use grid::GridState;
+use host::{Host, HostId};
 use input::{DecodedInput, InputDecoder};
 use keys::KeyMatch;
 use layout::Dir;
@@ -79,6 +83,19 @@ pub enum ServerEvent {
     ProgramCopy(TabId, String),
     /// SIGTERM or SIGHUP.
     Shutdown,
+    /// A hub reaching this host through `lux proxy`.
+    HubAttach {
+        conn: ConnId,
+        stream: UnixStream,
+    },
+    HubMsg(ConnId, wire::HubMsg),
+    HubGone(ConnId),
+    /// From the ssh connection to an adopted host.
+    Host {
+        host: HostId,
+        generation: u64,
+        event: host::HostEvent,
+    },
 }
 
 enum GridExit {
@@ -99,6 +116,9 @@ struct Client {
     switcher: Option<usize>,
     /// The switcher's new-session name prompt while it is open.
     new_session: Option<TextArea<'static>>,
+    /// Where a session named at that prompt should run, while the choice
+    /// is open.
+    host_choice: Option<HostChoice>,
     grid: Option<GridState>,
     auto: Option<AutoState>,
     finder: Option<find::FinderState>,
@@ -108,6 +128,13 @@ struct Client {
     pointer: &'static str,
     /// What the terminal has answered to the color queries sent at attach.
     colors: palette::TermColors,
+}
+
+struct HostChoice {
+    name: Option<String>,
+    /// `None` is this host.
+    hosts: Vec<Option<HostId>>,
+    highlight: usize,
 }
 
 pub fn run() -> i32 {
@@ -168,6 +195,11 @@ pub fn run() -> i32 {
         save_deadline: None,
         last_saved: None,
         tx,
+        hosts: BTreeMap::new(),
+        next_host_id: 0,
+        hub: None,
+        pending_hubs: Vec::new(),
+        instance: instance_id(),
     };
     if config.restore
         && let Some(snapshot) = persist::load()
@@ -197,9 +229,21 @@ pub fn run() -> i32 {
         }
         server.tick_agents();
         server.tick_auto();
+        server.tick_hosts();
+        server.sync_layouts();
+        server.sync_host_colors();
+        server.pump_hub();
         server.tick_save();
         server.render_all();
     }
+}
+
+/// Tells this server apart from others, so a hub never adopts itself.
+fn instance_id() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    nanos ^ (u64::from(std::process::id()) << 32)
 }
 
 const SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -231,6 +275,25 @@ fn connection_thread(conn: ConnId, stream: UnixStream, tx: Sender<ServerEvent>) 
         }
         Request::KillSession(name) => {
             let _ = tx.send(ServerEvent::KillSession(stream, name));
+        }
+        Request::Proxy => {
+            let Ok(reader) = stream.try_clone() else {
+                return;
+            };
+            let mut ack = &stream;
+            if ack.write_all(b"ok\n").is_err() {
+                return;
+            }
+            if tx.send(ServerEvent::HubAttach { conn, stream }).is_err() {
+                return;
+            }
+            let mut reader = std::io::BufReader::with_capacity(1 << 16, reader);
+            while let Ok(Some(msg)) = wire::read_frame(&mut reader) {
+                if tx.send(ServerEvent::HubMsg(conn, msg)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(ServerEvent::HubGone(conn));
         }
         Request::New | Request::Session(_) | Request::Recent => {
             let mut fds = fds.into_iter();
@@ -281,6 +344,14 @@ struct Server {
     save_deadline: Option<std::time::Instant>,
     last_saved: Option<String>,
     tx: Sender<ServerEvent>,
+    /// Hosts whose sessions this server adopted.
+    hosts: BTreeMap<HostId, Host>,
+    next_host_id: HostId,
+    /// The hub that adopted this host's sessions, or one mid-handshake.
+    hub: Option<serve::Hub>,
+    /// Hubs mid-handshake while another holds this host.
+    pending_hubs: Vec<serve::Hub>,
+    instance: u64,
 }
 
 impl Server {
@@ -305,6 +376,8 @@ impl Server {
     fn needs_timed_tick(&self) -> bool {
         self.has_pending_idle()
             || self.save_deadline.is_some()
+            || self.hosts_pending()
+            || self.adopted()
             || self.sessions.values().any(|s| s.has_pending_repeat())
             || self.any_shown(Session::has_animation)
     }
@@ -323,7 +396,15 @@ impl Server {
             session.tick_repeats(now);
         }
         for (session, notice) in notices {
-            self.raise_notification(&session, &notice);
+            self.notify(&session, &notice);
+        }
+    }
+
+    /// An adopting hub raises a served tab's notification in place of
+    /// this host.
+    fn notify(&mut self, session: &str, notice: &window::Notice) {
+        if !self.hub_notice(notice) {
+            self.raise_notification(session, notice);
         }
     }
 
@@ -378,8 +459,14 @@ impl Server {
     }
 
     fn save_sessions(&mut self) {
+        // Adopted sessions belong to their hosts.
         let snapshot = persist::StateSnapshot {
-            sessions: self.sessions.values_mut().map(Session::snapshot).collect(),
+            sessions: self
+                .sessions
+                .values_mut()
+                .filter(|s| !s.is_remote())
+                .map(Session::snapshot)
+                .collect(),
         };
         let Ok(json) = serde_json::to_string_pretty(&snapshot) else {
             return;
@@ -415,14 +502,18 @@ impl Server {
             | ServerEvent::PtyExited(_)
             | ServerEvent::Attach { .. }
             | ServerEvent::Input(..)
-            | ServerEvent::InputIdle(_) => self.mark_dirty(),
+            | ServerEvent::InputIdle(_)
+            | ServerEvent::HubMsg(..) => self.mark_dirty(),
             ServerEvent::Ls(_)
             | ServerEvent::Kill(_)
             | ServerEvent::KillSession(..)
             | ServerEvent::Resized(_)
             | ServerEvent::ConnGone(_)
             | ServerEvent::ProgramCopy(..)
-            | ServerEvent::Shutdown => {}
+            | ServerEvent::Shutdown
+            | ServerEvent::HubAttach { .. }
+            | ServerEvent::HubGone(_)
+            | ServerEvent::Host { .. } => {}
         }
         match event {
             ServerEvent::PtyOutput(tab, bytes) => {
@@ -430,18 +521,13 @@ impl Server {
                     let notice = session.pty_output(tab, &bytes);
                     let name = session.name.clone();
                     if let Some(notice) = notice {
-                        self.raise_notification(&name, &notice);
+                        self.notify(&name, &notice);
                     }
                 }
             }
             ServerEvent::PtyExited(tab) => {
-                let Some((&sid, session)) = self.sessions.iter_mut().find(|(_, s)| s.has_tab(tab))
-                else {
-                    return;
-                };
-                if let Some(Effect::Ended) = session.pty_exited(tab) {
-                    self.end_session(sid);
-                }
+                self.tab_exited(tab);
+                self.hub_tab_exited(tab);
             }
             ServerEvent::Attach {
                 conn,
@@ -453,13 +539,14 @@ impl Server {
                 self.attach(conn, stream, request, stdin, stdout);
             }
             ServerEvent::Ls(mut stream) => {
-                for session in self.sessions.values() {
+                for session in self.sessions.values().filter(|s| !s.is_remote()) {
                     let _ = protocol::write_line(&mut stream, &session.name);
                 }
             }
             ServerEvent::Kill(mut stream) => {
                 // Save first so the killed sessions restore on the next start.
                 self.save_sessions();
+                self.drop_hosts();
                 let _ = protocol::write_line(&mut stream, "ok");
                 let conns: Vec<ConnId> = self.clients.keys().copied().collect();
                 for conn in conns {
@@ -496,23 +583,21 @@ impl Server {
             ServerEvent::Input(conn, bytes) => self.client_input(conn, bytes),
             ServerEvent::InputIdle(conn) => self.client_input_idle(conn),
             ServerEvent::ProgramCopy(tab, text) => {
-                if let Some(clipboard) = &mut self.clipboard {
-                    let _ = clipboard.set_text(text.clone());
-                }
-                let Some(sid) = self
-                    .sessions
-                    .iter()
-                    .find(|(_, s)| s.has_tab(tab))
-                    .map(|(&sid, _)| sid)
-                else {
-                    return;
-                };
-                for client in self.clients.values_mut().filter(|c| c.attached == sid) {
-                    osc52_copy(&mut client.raw_out, &text);
+                if !self.hub_clipboard(tab, &text) {
+                    self.program_copy(tab, text);
                 }
             }
+            ServerEvent::HubAttach { conn, stream } => self.hub_attach(conn, stream),
+            ServerEvent::HubMsg(conn, msg) => self.hub_msg(conn, msg),
+            ServerEvent::HubGone(conn) => self.hub_gone(conn),
+            ServerEvent::Host {
+                host,
+                generation,
+                event,
+            } => self.host_event(host, generation, event),
             ServerEvent::Shutdown => {
                 self.save_sessions();
+                self.drop_hosts();
                 let conns: Vec<ConnId> = self.clients.keys().copied().collect();
                 for conn in conns {
                     self.detach(conn);
@@ -535,10 +620,16 @@ impl Server {
         let size = term::fd_size(&stdout_file);
         let area = Rect::new(0, 0, size.width, size.height);
 
+        if self.adopted() {
+            let _ =
+                protocol::write_line(&mut stream, "err this host's sessions are adopted by a hub");
+            return;
+        }
         let sid = match request {
             Request::New => self.create_session(None, area),
             Request::Session(name) => match self.session_by_name(&name) {
                 Some(sid) => Ok(sid),
+                None if name.contains('@') => Err(AT_IN_NAME.to_string()),
                 None => self.create_session(Some(name), area),
             },
             Request::Recent => match self.recent_session() {
@@ -597,6 +688,7 @@ impl Server {
                 attached: sid,
                 switcher: None,
                 new_session: None,
+                host_choice: None,
                 grid: None,
                 auto: None,
                 finder: None,
@@ -629,19 +721,43 @@ impl Server {
         self.attach_order.push(sid);
     }
 
+    /// A remote session counts only while its host is connected; past
+    /// that, the most recent local one.
     fn recent_session(&self) -> Option<SessionId> {
-        self.attach_order
+        let mut order = self
+            .attach_order
             .iter()
             .rev()
             .copied()
-            .find(|sid| self.sessions.contains_key(sid))
+            .filter(|sid| self.sessions.contains_key(sid));
+        let latest = order.next()?;
+        if self.reachable(&self.sessions[&latest]) {
+            return Some(latest);
+        }
+        order.find(|sid| !self.sessions[sid].is_remote())
     }
 
+    fn reachable(&self, session: &Session) -> bool {
+        session
+            .host
+            .as_ref()
+            .is_none_or(|h| self.hosts.get(&h.id).is_some_and(Host::online))
+    }
+
+    /// Only this host's own sessions go by bare name.
     fn session_by_name(&self, name: &str) -> Option<SessionId> {
         self.sessions
             .iter()
-            .find(|(_, s)| s.name == name)
+            .find(|(_, s)| !s.is_remote() && s.name == name)
             .map(|(&sid, _)| sid)
+    }
+
+    /// A bare name or `name@alias`.
+    fn session_by_address(&self, address: &str) -> Option<SessionId> {
+        match host::split_address(address) {
+            (name, None) => self.session_by_name(name),
+            (name, Some(alias)) => self.remote_session_by_name(self.host_by_alias(alias)?, name),
+        }
     }
 
     /// Drops the connection but not the session. The client restores its
@@ -656,7 +772,29 @@ impl Server {
         let _ = client.control.shutdown(Shutdown::Both);
     }
 
+    /// Ends a session, on its host too when it runs on one.
     fn end_session(&mut self, sid: SessionId) {
+        let Some(session) = self.sessions.get(&sid) else {
+            return;
+        };
+        match &session.host {
+            Some(host) => {
+                let (link, remote) = (host.link.clone(), host.remote);
+                // A tab pasted out of the session must reach its new
+                // layout before the host drops the session.
+                self.sync_layouts();
+                link.send(wire::HubMsg::KillSession(remote));
+                self.remove_session(sid);
+            }
+            None => {
+                self.remove_session(sid);
+                self.hub_session_ended(sid);
+            }
+        }
+    }
+
+    /// Forgets a session and detaches its client, leaving any host alone.
+    fn remove_session(&mut self, sid: SessionId) {
         self.sessions.remove(&sid);
         // Without this a CLI kill-session only persists if some other event
         // saves before the server exits.
@@ -677,10 +815,86 @@ impl Server {
         }
     }
 
-    /// The CLAUDECOM entry leads the switcher list while any agent tab
-    /// exists.
+    fn tab_exited(&mut self, tab: TabId) {
+        let Some((&sid, session)) = self.sessions.iter_mut().find(|(_, s)| s.has_tab(tab)) else {
+            return;
+        };
+        if let Some(Effect::Ended) = session.pty_exited(tab) {
+            self.end_session(sid);
+        }
+    }
+
+    fn program_copy(&mut self, tab: TabId, text: String) {
+        if let Some(clipboard) = &mut self.clipboard {
+            let _ = clipboard.set_text(text.clone());
+        }
+        let Some(sid) = self
+            .sessions
+            .iter()
+            .find(|(_, s)| s.has_tab(tab))
+            .map(|(&sid, _)| sid)
+        else {
+            return;
+        };
+        for client in self.clients.values_mut().filter(|c| c.attached == sid) {
+            osc52_copy(&mut client.raw_out, &text);
+        }
+    }
+
+    /// Shows a status message to one client.
+    fn tell(&mut self, conn: ConnId, text: String) {
+        let Some(sid) = self.clients.get(&conn).map(|c| c.attached) else {
+            return;
+        };
+        if let Some(session) = self.sessions.get_mut(&sid) {
+            session.show_message(text);
+        }
+    }
+
+    /// Shows a status message to every client.
+    fn tell_all(&mut self, text: String) {
+        let sids: Vec<SessionId> = self.clients.values().map(|c| c.attached).collect();
+        for sid in sids {
+            if let Some(session) = self.sessions.get_mut(&sid) {
+                session.show_message(text.clone());
+            }
+        }
+    }
+
+    /// Attaches a client to another session, taking it from any client
+    /// already there.
+    fn switch_client(&mut self, conn: ConnId, target: SessionId) {
+        let Some(client) = self.clients.get(&conn) else {
+            return;
+        };
+        let size = term::fd_size(&client.raw_out);
+        if client.attached != target
+            && let Some(other) = self
+                .clients
+                .iter()
+                .find(|(c, cl)| **c != conn && cl.attached == target)
+                .map(|(conn, _)| *conn)
+        {
+            self.detach(other);
+        }
+        if let Some(client) = self.clients.get_mut(&conn) {
+            client.attached = target;
+            client.switcher = None;
+            client.new_session = None;
+            client.host_choice = None;
+            client.auto = None;
+        }
+        self.note_attached(target);
+        if let Some(session) = self.sessions.get_mut(&target) {
+            session.set_area(Rect::new(0, 0, size.width, size.height));
+            session.request_redraw();
+        }
+    }
+
+    /// The CLAUDECOM entry leads the switcher list while any local agent
+    /// tab exists.
     fn pinned_entries(&self) -> usize {
-        self.sessions.values().any(Session::has_agent_tab) as usize
+        pinned(&self.sessions)
     }
 
     fn client_input(&mut self, conn: ConnId, bytes: Vec<u8>) {
@@ -760,20 +974,32 @@ impl Server {
             Effect::OpenFinder => self.open_finder(conn),
             Effect::NewSession(name) => self.new_session_for(conn, name),
             Effect::RenameSession(name) => {
+                if name.contains('@') {
+                    self.tell(conn, AT_IN_NAME.into());
+                    return;
+                }
                 if let Some(session) = self.sessions.get_mut(&sid) {
+                    if let Some(host) = &session.host {
+                        host.link.send(wire::HubMsg::RenameSession {
+                            session: host.remote,
+                            name: name.clone(),
+                        });
+                    }
                     session.name = name;
                     session.request_redraw();
                 }
             }
             Effect::KillSession(name) => {
                 let target = match name {
-                    Some(n) => self.session_by_name(&n),
+                    Some(n) => self.session_by_address(&n),
                     None => Some(sid),
                 };
                 if let Some(target_sid) = target {
                     self.end_session(target_sid);
                 }
             }
+            Effect::Connect(alias) => self.connect(conn, alias),
+            Effect::Disconnect(alias) => self.disconnect(conn, alias),
             Effect::ReloadConfig => match config::reload() {
                 Ok(config) => {
                     self.config = Arc::new(config);
@@ -866,6 +1092,14 @@ impl Server {
         if self
             .clients
             .get(&conn)
+            .is_some_and(|c| c.host_choice.is_some())
+        {
+            self.host_choice_input(conn, key);
+            return;
+        }
+        if self
+            .clients
+            .get(&conn)
             .is_some_and(|c| c.new_session.is_some())
         {
             self.new_session_prompt_input(conn, key);
@@ -933,14 +1167,30 @@ impl Server {
                 let text = prompt.lines().first().cloned().unwrap_or_default();
                 client.new_session = None;
                 let name = (!text.is_empty()).then_some(text);
-                if name
-                    .as_deref()
-                    .is_some_and(|n| self.session_by_name(n).is_some())
-                {
+                // An address already names its host.
+                let hosts: Vec<Option<HostId>> = std::iter::once(None)
+                    .chain(
+                        self.hosts
+                            .iter()
+                            .filter(|(_, h)| h.online())
+                            .map(|(&id, _)| Some(id)),
+                    )
+                    .collect();
+                if hosts.len() > 1 && !name.as_deref().is_some_and(|n| n.contains('@')) {
+                    if let Some(client) = self.clients.get_mut(&conn) {
+                        client.host_choice = Some(HostChoice {
+                            name,
+                            hosts,
+                            highlight: 0,
+                        });
+                    }
                     return;
                 }
-                if let Some(client) = self.clients.get_mut(&conn) {
-                    client.switcher = None;
+                if name
+                    .as_deref()
+                    .is_some_and(|n| self.session_by_address(n).is_some())
+                {
+                    return;
                 }
                 self.new_session_for(conn, name);
             }
@@ -950,12 +1200,62 @@ impl Server {
         }
     }
 
+    /// Enter creates the session on the highlighted host; Escape returns
+    /// to the switcher.
+    fn host_choice_input(&mut self, conn: ConnId, key: &KeyEvent) {
+        let Some(choice) = self
+            .clients
+            .get_mut(&conn)
+            .and_then(|c| c.host_choice.as_mut())
+        else {
+            return;
+        };
+        let count = choice.hosts.len();
+        match key.code {
+            CtKeyCode::Esc => {
+                if let Some(client) = self.clients.get_mut(&conn) {
+                    client.host_choice = None;
+                }
+            }
+            CtKeyCode::Left | CtKeyCode::Up | CtKeyCode::BackTab | CtKeyCode::Char('h' | 'k') => {
+                choice.highlight = choice.highlight.checked_sub(1).unwrap_or(count - 1);
+            }
+            CtKeyCode::Right | CtKeyCode::Down | CtKeyCode::Tab | CtKeyCode::Char('l' | 'j') => {
+                choice.highlight = (choice.highlight + 1) % count;
+            }
+            CtKeyCode::Enter => {
+                let Some(choice) = self
+                    .clients
+                    .get_mut(&conn)
+                    .and_then(|c| c.host_choice.take())
+                else {
+                    return;
+                };
+                match choice.hosts[choice.highlight] {
+                    None => {
+                        if choice
+                            .name
+                            .as_deref()
+                            .is_some_and(|n| self.session_by_name(n).is_some())
+                        {
+                            return;
+                        }
+                        self.new_session_for(conn, choice.name);
+                    }
+                    Some(host) => self.new_remote_session(conn, host, choice.name),
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn switcher_cancel(&mut self, conn: ConnId) {
         let Some(client) = self.clients.get_mut(&conn) else {
             return;
         };
         client.switcher = None;
         client.new_session = None;
+        client.host_choice = None;
         let sid = client.attached;
         if let Some(session) = self.sessions.get_mut(&sid) {
             session.request_redraw();
@@ -1151,13 +1451,18 @@ impl Server {
     }
 
     /// The first attention tab after `cursor` in grid order, wrapping.
+    /// Auto mode leaves out remote sessions.
     fn next_attention(
         &self,
         cursor: Option<(usize, usize, usize)>,
+        remote: bool,
     ) -> Option<(SessionId, layout::WindowId, usize)> {
         let mut queue = Vec::new();
         for (spos, &sid) in self.sessions_by_name().iter().enumerate() {
             let session = &self.sessions[&sid];
+            if session.is_remote() && !remote {
+                continue;
+            }
             let order = session.window_order();
             for (window, index) in session.attention_tabs() {
                 let wpos = order.iter().position(|&w| w == window).unwrap_or(0);
@@ -1186,7 +1491,7 @@ impl Server {
             let wpos = order.iter().position(|&w| w == window).unwrap_or(0);
             Some((spos, wpos, index))
         });
-        if let Some((sid, window, index)) = self.next_attention(cursor) {
+        if let Some((sid, window, index)) = self.next_attention(cursor, true) {
             self.attach_to_tab(conn, sid, window, index);
         }
     }
@@ -1202,6 +1507,22 @@ impl Server {
         let Some(dest_focus) = self.sessions.get(&dest_sid).map(|s| s.focused_active().0) else {
             return;
         };
+        let host_of = |sid: SessionId| {
+            self.sessions
+                .get(&sid)
+                .and_then(|s| s.host.as_ref())
+                .map(|h| h.id)
+        };
+        // A running PTY can't move to another machine.
+        if let Some((src_sid, ..)) = self.locate(id)
+            && host_of(src_sid) != host_of(dest_sid)
+        {
+            self.tell(
+                conn,
+                "a tab can only move between sessions on the same host".into(),
+            );
+            return;
+        }
         if let Some(client) = self.clients.get_mut(&conn) {
             client.yank = None;
         }
@@ -1261,7 +1582,7 @@ impl Server {
                 }
             }
             let cursor = state.presented.and_then(|id| self.order_key(id));
-            match self.next_attention(cursor) {
+            match self.next_attention(cursor, false) {
                 Some((sid, window, index)) => self.attach_to_tab(conn, sid, window, index),
                 None => {
                     if let Some(state) = self.clients.get_mut(&conn).and_then(|c| c.auto.as_mut()) {
@@ -1391,7 +1712,16 @@ impl Server {
         }
     }
 
+    /// `name@alias` creates the session on that host.
     fn new_session_for(&mut self, conn: ConnId, name: Option<String>) {
+        if let Some((local, Some(alias))) = name.as_deref().map(host::split_address) {
+            let local = (!local.is_empty()).then(|| local.to_string());
+            match self.host_by_alias(alias) {
+                Some(host) => self.new_remote_session(conn, host, local),
+                None => self.tell(conn, format!("not connected to {alias}")),
+            }
+            return;
+        }
         if let Some(name) = &name
             && self.session_by_name(name).is_some()
         {
@@ -1408,6 +1738,7 @@ impl Server {
         if let Some(client) = self.clients.get_mut(&conn) {
             client.attached = sid;
             client.auto = None;
+            client.switcher = None;
         }
         self.note_attached(sid);
         if let Some(session) = self.sessions.get_mut(&sid) {
@@ -1597,6 +1928,7 @@ impl Server {
     /// Full-screen modes redraw every pass. Attached sessions redraw only
     /// when they changed.
     fn render_all(&mut self) {
+        self.mark_host_state();
         // The indicator spans sessions, so compute it here and hand it to
         // the session to render.
         let indicators: Vec<(SessionId, session::Indicator)> = self
@@ -1638,6 +1970,7 @@ impl Server {
             sessions,
             clients,
             config,
+            hosts,
             ..
         } = self;
         for client in clients.values_mut() {
@@ -1646,7 +1979,7 @@ impl Server {
             } else if client.grid.is_some() {
                 render_grid(client, sessions, &config.palette);
             } else if let Some(highlight) = client.switcher {
-                render_switcher(client, sessions, highlight, config);
+                render_switcher(client, sessions, hosts, highlight, config);
             } else if client.auto.is_some_and(|a| a.presented.is_none()) {
                 render_auto_blank(client, sessions, &config.palette);
             } else if let Some(session) = sessions.get_mut(&client.attached)
@@ -1718,22 +2051,38 @@ fn render_grid(
 
 const SWITCHER_LIST_WIDTH: u16 = 28;
 
+/// One switcher row: the host tag, the text, its urgency, and whether its
+/// host is unreachable.
+struct SwitcherEntry {
+    tag: Option<String>,
+    text: String,
+    urgency: Option<agent::Urgency>,
+    offline: bool,
+}
+
 fn render_switcher(
     client: &mut Client,
     sessions: &mut BTreeMap<SessionId, Session>,
+    hosts: &BTreeMap<HostId, Host>,
     highlight: usize,
     config: &Config,
 ) {
     let palette = &config.palette;
-    let pinned = sessions.values().any(Session::has_agent_tab) as usize;
-    let mut entries: Vec<(String, Option<agent::Urgency>)> =
-        Vec::with_capacity(pinned + sessions.len());
+    let pinned = pinned(sessions);
+    let mut entries: Vec<SwitcherEntry> = Vec::with_capacity(pinned + sessions.len());
     if pinned > 0 {
-        entries.push((grid::ENTRY_NAME.to_string(), None));
+        entries.push(SwitcherEntry {
+            tag: None,
+            text: grid::ENTRY_NAME.to_string(),
+            urgency: None,
+            offline: false,
+        });
     }
-    entries.extend(sessions.values().map(|s| {
-        let name = format!("{} ({} windows)", s.name, s.window_count());
-        (name, s.urgency())
+    entries.extend(sessions.values().map(|s| SwitcherEntry {
+        tag: s.host.as_ref().map(|h| h.tag.clone()),
+        text: format!("{} ({} windows)", s.name, s.window_count()),
+        urgency: s.urgency().filter(|_| !s.is_offline()),
+        offline: s.is_offline(),
     }));
     let highlight = highlight.min(entries.len().saturating_sub(1));
     let highlighted_sid = highlight
@@ -1743,6 +2092,7 @@ fn render_switcher(
     let Client {
         terminal,
         new_session,
+        host_choice,
         colors,
         ..
     } = client;
@@ -1755,28 +2105,37 @@ fn render_switcher(
         let buf = frame.buffer_mut();
         clear_region(buf, area);
         let list_w = SWITCHER_LIST_WIDTH.min(area.width);
-        for (i, (name, urgency)) in entries.iter().enumerate() {
+        for (i, entry) in entries.iter().enumerate() {
             let y = area.y + 1 + i as u16;
             if y >= area.bottom() {
                 break;
             }
-            let (base, modifier) = if i == highlight {
-                (palette.accent, Modifier::REVERSED)
-            } else {
-                (palette.text, Modifier::empty())
+            let urgency = entry.urgency;
+            let (base, modifier) = match (i == highlight, entry.offline) {
+                (true, false) => (palette.accent, Modifier::REVERSED),
+                (true, true) => (palette.dim, Modifier::REVERSED),
+                (false, false) => (palette.text, Modifier::empty()),
+                (false, true) => (palette.dim, Modifier::empty()),
             };
             let (color, anim) = urgency.map_or((base, Anim::None), |urgency| {
                 let (status, anim) = urgency.visual();
                 (palette.status(status), anim)
             });
-            let text = format!(" {name} ");
+            let tag = entry
+                .tag
+                .as_ref()
+                .map_or(String::new(), |t| format!("{t} "));
+            let tag_len = tag.chars().count();
+            let text = format!(" {tag}{} ", entry.text);
             let len = text.chars().count();
             for (j, ch) in text.chars().enumerate() {
                 let x = area.x + j as u16;
                 if x >= area.x + list_w {
                     break;
                 }
+                let in_tag = (1..=tag_len).contains(&j);
                 let fg = match anim {
+                    _ if in_tag && !entry.offline => palette.muted,
                     Anim::None => color,
                     Anim::Shimmer => anim::shimmer(color, j, len, elapsed),
                     Anim::Breathe => anim::breathe(color, elapsed),
@@ -1851,10 +2210,56 @@ fn render_switcher(
             };
             prompt.render(input, buf);
         }
+        if let Some(choice) = host_choice.as_ref()
+            && area.height > 0
+        {
+            let line = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+            clear_region(buf, line);
+            let mut x = line.x;
+            let mut put = |text: &str, style: Style| {
+                for ch in text.chars() {
+                    if x >= line.right() {
+                        return;
+                    }
+                    if let Some(dst) = buf.cell_mut(Position::new(x, line.y)) {
+                        dst.set_char(ch);
+                        dst.set_style(style);
+                    }
+                    x += 1;
+                }
+            };
+            put(HOST_CHOICE_LABEL, Style::default());
+            for (i, host) in choice.hosts.iter().enumerate() {
+                let name = match host {
+                    Some(id) => hosts.get(id).map_or("?", |h| h.alias.as_str()),
+                    None => session::hostname(),
+                };
+                let style = if i == choice.highlight {
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default().fg(palette.text)
+                };
+                put(&format!(" {name} "), style);
+                put(" ", Style::default());
+            }
+        }
     });
 }
 
 const NEW_SESSION_LABEL: &str = "new session: ";
+
+const HOST_CHOICE_LABEL: &str = "run on: ";
+
+const AT_IN_NAME: &str = "session names cannot contain '@'";
+
+fn pinned(sessions: &BTreeMap<SessionId, Session>) -> usize {
+    sessions
+        .values()
+        .filter(|s| !s.is_remote())
+        .any(Session::has_agent_tab) as usize
+}
 
 pub(crate) fn clear_region(buf: &mut Buffer, area: Rect) {
     for y in area.top()..area.bottom() {
