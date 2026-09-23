@@ -37,7 +37,7 @@ use ratatui::crossterm::event::{
     MouseButton as CtMouseButton, MouseEventKind as CtMouseKind,
 };
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 use ratatui_textarea::TextArea;
 
@@ -1747,6 +1747,9 @@ fn render_switcher(
         ..
     } = client;
     let colors = *colors;
+    let default_bg = colors
+        .bg
+        .map_or(palette.bg, |(r, g, b)| Color::Rgb(r, g, b));
     let _ = terminal.draw(|frame| {
         let area = frame.area();
         let buf = frame.buffer_mut();
@@ -1778,9 +1781,16 @@ fn render_switcher(
                     Anim::Shimmer => anim::shimmer(color, j, len, elapsed),
                     Anim::Breathe => anim::breathe(color, elapsed),
                 };
+                // Explicit colors, since some terminals reverse a default
+                // background into the default foreground.
+                let style = if i == highlight && urgency.is_some() {
+                    Style::default().fg(default_bg).bg(fg)
+                } else {
+                    Style::default().fg(fg).add_modifier(modifier)
+                };
                 if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
                     dst.set_char(ch);
-                    dst.set_style(Style::default().fg(fg).add_modifier(modifier));
+                    dst.set_style(style);
                 }
             }
         }

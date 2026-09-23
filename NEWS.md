@@ -1,5 +1,10 @@
 # News
 
+## 2026-09-22
+
+- The switcher's highlighted row keeps its animated agent-status color
+  instead of showing the terminal's default foreground.
+
 ## 2026-09-20
 
 - Configuration `attach-style` accepts `rain` or `coalesce` and sets the attach
