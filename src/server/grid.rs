@@ -1,5 +1,4 @@
-//! The CLAUDECOM grid: a pinned switcher entry that tiles every agent tab
-//! across all sessions.
+//! The CLAUDECOM grid: tiles every agent tab across all sessions.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -14,8 +13,6 @@ use crate::server::palette::Palette;
 use crate::server::session::{Session, cell_style};
 use crate::server::window::{Tab, TabId};
 use crate::server::{SessionId, clear_region};
-
-pub const ENTRY_NAME: &str = "*CLAUDECOM*";
 
 // Tile height is fixed because screen-derived heights made tiles too
 // tall to read.
@@ -155,16 +152,6 @@ pub fn render(
         state.capture,
         palette,
     );
-}
-
-pub fn render_preview(
-    buf: &mut Buffer,
-    area: Rect,
-    sessions: &mut BTreeMap<SessionId, Session>,
-    palette: &Palette,
-) {
-    let items = items(sessions);
-    draw(buf, area, sessions, &items, None, 0, None, palette);
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -366,8 +366,10 @@ impl Server {
 
     fn any_shown(&self, pred: impl Fn(&Session) -> bool) -> bool {
         self.clients.values().any(|c| {
-            // The switcher, grid, and blank auto screen show every session.
+            // The switcher, sidebar, grid, and blank auto screen show every
+            // session.
             if c.switcher.is_some()
+                || self.config.sidebar
                 || c.grid.is_some()
                 || c.auto.is_some_and(|a| a.presented.is_none())
             {
@@ -544,8 +546,15 @@ impl Server {
                 self.attach(conn, stream, request, stdin, stdout);
             }
             ServerEvent::Ls(mut stream) => {
-                for session in self.sessions.values().filter(|s| !s.is_remote()) {
-                    let _ = protocol::write_line(&mut stream, &session.name);
+                for session in self.sessions.values() {
+                    let line = match &session.host {
+                        None => session.name.clone(),
+                        Some(h) => match self.hosts.get(&h.id).filter(|h| h.online()) {
+                            Some(host) => format!("{}@{}", session.name, host.alias),
+                            None => continue,
+                        },
+                    };
+                    let _ = protocol::write_line(&mut stream, &line);
                 }
             }
             ServerEvent::Kill(mut stream) => {
@@ -579,7 +588,7 @@ impl Server {
                 let size = term::fd_size(&client.raw_out);
                 client.terminal.backend_mut().set_size(size);
                 if let Some(session) = self.sessions.get_mut(&client.attached) {
-                    session.set_area(Rect::new(0, 0, size.width, size.height));
+                    session.set_area(session_area(&self.config, size));
                 }
             }
             ServerEvent::ConnGone(conn) => {
@@ -623,8 +632,7 @@ impl Server {
         stdout: OwnedFd,
     ) {
         let stdout_file = File::from(stdout);
-        let size = term::fd_size(&stdout_file);
-        let area = Rect::new(0, 0, size.width, size.height);
+        let area = session_area(&self.config, term::fd_size(&stdout_file));
 
         if self.adopted() {
             let _ =
@@ -670,7 +678,7 @@ impl Server {
             return;
         }
         let size = term::fd_size(&stdout_file);
-        let area = Rect::new(0, 0, size.width, size.height);
+        let area = session_area(&self.config, size);
 
         if let Some(&old) = self
             .clients
@@ -829,7 +837,7 @@ impl Server {
         {
             self.detach(conn);
         }
-        let remaining = self.pinned_entries() + self.sessions.len();
+        let remaining = self.sessions.len();
         for client in self.clients.values_mut() {
             if let Some(highlight) = client.switcher.as_mut() {
                 *highlight = (*highlight).min(remaining.saturating_sub(1));
@@ -908,15 +916,19 @@ impl Server {
         }
         self.note_attached(target);
         if let Some(session) = self.sessions.get_mut(&target) {
-            session.set_area(Rect::new(0, 0, size.width, size.height));
+            session.set_area(session_area(&self.config, size));
             session.request_redraw();
         }
     }
 
-    /// The CLAUDECOM entry leads the switcher list while any local agent
-    /// tab exists.
-    fn pinned_entries(&self) -> usize {
-        pinned(&self.sessions)
+    /// Sizes each client's session to what its terminal leaves it.
+    fn fit_sessions(&mut self) {
+        for client in self.clients.values() {
+            let size = term::fd_size(&client.raw_out);
+            if let Some(session) = self.sessions.get_mut(&client.attached) {
+                session.set_area(session_area(&self.config, size));
+            }
+        }
     }
 
     fn client_input(&mut self, conn: ConnId, bytes: Vec<u8>) {
@@ -963,6 +975,14 @@ impl Server {
                 self.auto_input(conn, &event);
                 continue;
             }
+            if let DecodedInput::Mouse(mouse) = &event
+                && self.sidebar_mouse(conn, mouse)
+            {
+                continue;
+            }
+            let Some(client) = self.clients.get(&conn) else {
+                return;
+            };
             let sid = client.attached;
             let Some(session) = self.sessions.get_mut(&sid) else {
                 continue;
@@ -1022,19 +1042,8 @@ impl Server {
             }
             Effect::Connect(alias) => self.connect(conn, alias),
             Effect::Disconnect(alias) => self.disconnect(conn, alias),
-            Effect::ReloadConfig => match config::reload() {
-                Ok(config) => {
-                    self.config = Arc::new(config);
-                    for session in self.sessions.values_mut() {
-                        session.set_config(self.config.clone());
-                    }
-                    if let Some(session) = self.sessions.get_mut(&sid) {
-                        session.show_message("config reloaded".into());
-                    }
-                }
-                // Every session keeps the config it has.
-                Err(err) => eprintln!("lux: {err}"),
-            },
+            Effect::ReloadConfig => self.apply_config(sid, config::reload()),
+            Effect::SetConfig(key, value) => self.apply_config(sid, config::set(&key, &value)),
             // OSC 52 too, so an outer terminal or SSH hop sees it.
             Effect::Copy(text) => {
                 if let Some(clipboard) = &mut self.clipboard {
@@ -1069,6 +1078,62 @@ impl Server {
             }
             Effect::CycleAgent => self.cycle_agent(conn),
             Effect::Ended => self.end_session(sid),
+        }
+    }
+
+    /// Presses and hovers over an unfocused sidebar. Drags and releases
+    /// pass through, so one begun in the layout can finish there.
+    fn sidebar_mouse(
+        &mut self,
+        conn: ConnId,
+        mouse: &ratatui::crossterm::event::MouseEvent,
+    ) -> bool {
+        let Some(client) = self.clients.get(&conn) else {
+            return false;
+        };
+        if mouse.column >= sidebar_width(&self.config, term::fd_size(&client.raw_out)) {
+            return false;
+        }
+        let entry = self.switcher_entry_at(conn, mouse.column, mouse.row);
+        match mouse.kind {
+            CtMouseKind::Drag(_) | CtMouseKind::Up(_) => return false,
+            CtMouseKind::Moved => {
+                self.set_pointer(
+                    conn,
+                    if entry.is_some() {
+                        "pointer"
+                    } else {
+                        "default"
+                    },
+                );
+            }
+            CtMouseKind::Down(CtMouseButton::Left) => {
+                if let Some(index) = entry {
+                    self.switcher_select(conn, index);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// On error every session keeps the config it has.
+    fn apply_config(&mut self, sid: SessionId, config: Result<Config, String>) {
+        let config = match config {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("lux: {err}");
+                return;
+            }
+        };
+        self.config = Arc::new(config);
+        for session in self.sessions.values_mut() {
+            session.set_config(self.config.clone());
+        }
+        // The sidebar may have come or gone.
+        self.fit_sessions();
+        if let Some(session) = self.sessions.get_mut(&sid) {
+            session.show_message("config reloaded".into());
         }
     }
 
@@ -1127,15 +1192,14 @@ impl Server {
             self.new_session_prompt_input(conn, key);
             return;
         }
-        let pinned = self.pinned_entries();
-        let count = pinned + self.sessions.len();
+        let count = self.sessions.len();
         let Some(client) = self.clients.get_mut(&conn) else {
             return;
         };
         let Some(highlight) = client.switcher else {
             return;
         };
-        // The pinned entry can vanish while the switcher is open.
+        // Sessions can end while the switcher is open.
         let highlight = highlight.min(count.saturating_sub(1));
         let ctrl = key
             .modifiers
@@ -1313,26 +1377,19 @@ impl Server {
             return false;
         };
         let size = term::fd_size(&client.raw_out);
-        size.height > 0 && column == 0 && row == size.height - 1
+        // Beside the sidebar, the session's own status line icon.
+        let x = sidebar_width(&self.config, size);
+        size.height > 0 && column == x && row == size.height - 1
     }
 
     fn switcher_select(&mut self, conn: ConnId, highlight: usize) {
-        let pinned = self.pinned_entries();
         let Some(client) = self.clients.get_mut(&conn) else {
             return;
         };
         client.switcher = None;
         client.new_session = None;
-        if highlight < pinned {
-            if self.config.automode {
-                self.begin_auto(conn);
-            } else {
-                client.grid = Some(GridState::default());
-            }
-            return;
-        }
         client.auto = None;
-        let Some(&target) = self.sessions.keys().nth(highlight - pinned) else {
+        let Some(&target) = self.sessions.keys().nth(highlight) else {
             return;
         };
         let current = client.attached;
@@ -1352,13 +1409,13 @@ impl Server {
         }
         self.note_attached(target);
         if let Some(session) = self.sessions.get_mut(&target) {
-            session.set_area(Rect::new(0, 0, size.width, size.height));
+            session.set_area(session_area(&self.config, size));
             session.request_redraw();
         }
     }
 
     fn switcher_entry_at(&self, conn: ConnId, column: u16, row: u16) -> Option<usize> {
-        let count = self.pinned_entries() + self.sessions.len();
+        let count = self.sessions.len();
         let client = self.clients.get(&conn)?;
         let size = term::fd_size(&client.raw_out);
         if column >= SWITCHER_LIST_WIDTH.min(size.width) || row < 1 {
@@ -1700,7 +1757,7 @@ impl Server {
         if let Some(session) = self.sessions.get_mut(&sid) {
             // Set the area first: restoring a minimized window checks
             // minimum sizes against it.
-            session.set_area(Rect::new(0, 0, size.width, size.height));
+            session.set_area(session_area(&self.config, size));
             session.goto_tab(window, index);
             session.request_redraw();
         }
@@ -1721,8 +1778,7 @@ impl Server {
             return;
         };
         let sid = client.attached;
-        let highlight =
-            self.pinned_entries() + self.sessions.keys().position(|&id| id == sid).unwrap_or(0);
+        let highlight = self.sessions.keys().position(|&id| id == sid).unwrap_or(0);
         if let Some(client) = self.clients.get_mut(&conn) {
             client.grid = None;
             client.switcher = Some(highlight);
@@ -1766,8 +1822,7 @@ impl Server {
         let Some(client) = self.clients.get(&conn) else {
             return;
         };
-        let size = term::fd_size(&client.raw_out);
-        let area = Rect::new(0, 0, size.width, size.height);
+        let area = session_area(&self.config, term::fd_size(&client.raw_out));
         let Ok(sid) = self.create_session(name, area) else {
             return;
         };
@@ -1971,10 +2026,12 @@ impl Server {
             .clients
             .values()
             .filter(|c| {
+                // The sidebar holding focus leaves its session in view.
+                let beside = sidebar_width(&self.config, term::fd_size(&c.raw_out)) > 0;
                 c.finder.is_none()
                     && c.grid.is_none()
-                    && c.switcher.is_none()
-                    && !c.auto.is_some_and(|a| a.presented.is_none())
+                    && (c.switcher.is_none() || beside)
+                    && !(c.switcher.is_none() && c.auto.is_some_and(|a| a.presented.is_none()))
             })
             .filter_map(|c| Some((c.attached, self.pending_indicator(c.attached)?)))
             .collect();
@@ -2010,18 +2067,26 @@ impl Server {
             ..
         } = self;
         for client in clients.values_mut() {
+            let sidebar = sidebar_width(config, term::fd_size(&client.raw_out));
             if client.finder.is_some() {
                 render_finder(client, sessions, config);
             } else if client.grid.is_some() {
                 render_grid(client, sessions, &config.palette);
-            } else if let Some(highlight) = client.switcher {
+            } else if let Some(highlight) = client.switcher
+                && sidebar == 0
+            {
                 render_switcher(client, sessions, hosts, highlight, config);
-            } else if client.auto.is_some_and(|a| a.presented.is_none()) {
+            } else if client.switcher.is_none()
+                && client.auto.is_some_and(|a| a.presented.is_none())
+            {
                 render_auto_blank(client, sessions, &config.palette);
+            } else if sidebar > 0 {
+                // Any session's change can show in the sidebar.
+                render_with_sidebar(client, sessions, hosts, config, sidebar);
             } else if let Some(session) = sessions.get_mut(&client.attached)
                 && session.needs_redraw()
             {
-                let _ = session.draw_frame(&mut client.terminal);
+                let _ = session.draw_frame(&mut client.terminal, true, |_| {});
             }
         }
     }
@@ -2096,6 +2161,159 @@ struct SwitcherEntry {
     offline: bool,
 }
 
+/// The list plus its divider.
+const SIDEBAR_WIDTH: u16 = SWITCHER_LIST_WIDTH + 1;
+
+/// The narrowest layout the sidebar still makes room for.
+const SIDEBAR_MIN_LAYOUT: u16 = 20;
+
+/// Zero while the sidebar is off or the terminal is too narrow for it.
+fn sidebar_width(config: &Config, size: ratatui::layout::Size) -> u16 {
+    if config.sidebar && size.width >= SIDEBAR_WIDTH + SIDEBAR_MIN_LAYOUT {
+        SIDEBAR_WIDTH
+    } else {
+        0
+    }
+}
+
+/// Where a client's attached session draws: right of any sidebar.
+fn session_area(config: &Config, size: ratatui::layout::Size) -> Rect {
+    let x = sidebar_width(config, size);
+    Rect::new(x, 0, size.width - x, size.height)
+}
+
+fn switcher_entries(sessions: &BTreeMap<SessionId, Session>) -> Vec<SwitcherEntry> {
+    sessions
+        .values()
+        .map(|s| SwitcherEntry {
+            tag: s.host.as_ref().map(|h| h.tag.clone()),
+            text: format!("{} ({} windows)", s.name, s.window_count()),
+            urgency: s.urgency().filter(|_| !s.is_offline()),
+            offline: s.is_offline(),
+        })
+        .collect()
+}
+
+/// One row per entry below a blank top row, with a divider on the right
+/// when `area` has room. An unfocused list marks its highlight in bold
+/// rather than reversed.
+fn render_session_list(
+    buf: &mut Buffer,
+    area: Rect,
+    entries: &[SwitcherEntry],
+    highlight: usize,
+    focused: bool,
+    palette: &palette::Palette,
+    colors: &palette::TermColors,
+) {
+    let elapsed = anim::elapsed();
+    let default_bg = colors
+        .bg
+        .map_or(palette.bg, |(r, g, b)| Color::Rgb(r, g, b));
+    let mark = if focused {
+        Modifier::REVERSED
+    } else {
+        Modifier::BOLD
+    };
+    let list_w = SWITCHER_LIST_WIDTH.min(area.width);
+    for (i, entry) in entries.iter().enumerate() {
+        let y = area.y + 1 + i as u16;
+        if y >= area.bottom() {
+            break;
+        }
+        let urgency = entry.urgency;
+        let (base, modifier) = match (i == highlight, entry.offline) {
+            (true, false) => (palette.accent, mark),
+            (true, true) => (palette.dim, mark),
+            (false, false) => (palette.text, Modifier::empty()),
+            (false, true) => (palette.dim, Modifier::empty()),
+        };
+        let (color, anim) = urgency.map_or((base, Anim::None), |urgency| {
+            let (status, anim) = urgency.visual();
+            (palette.status(status), anim)
+        });
+        let tag = entry
+            .tag
+            .as_ref()
+            .map_or(String::new(), |t| format!("{t} "));
+        let tag_len = tag.chars().count();
+        let text = format!(" {tag}{} ", entry.text);
+        let len = text.chars().count();
+        for (j, ch) in text.chars().enumerate() {
+            let x = area.x + j as u16;
+            if x >= area.x + list_w {
+                break;
+            }
+            let in_tag = (1..=tag_len).contains(&j);
+            let fg = match anim {
+                _ if in_tag && !entry.offline => palette.muted,
+                Anim::None => color,
+                Anim::Shimmer => anim::shimmer(color, j, len, elapsed),
+                Anim::Breathe => anim::breathe(color, elapsed),
+            };
+            // Explicit colors, since some terminals reverse a default
+            // background into the default foreground.
+            let style = if focused && i == highlight && urgency.is_some() {
+                Style::default().fg(default_bg).bg(fg)
+            } else {
+                Style::default().fg(fg).add_modifier(modifier)
+            };
+            if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
+                dst.set_char(ch);
+                dst.set_style(style);
+            }
+        }
+    }
+    if area.width > list_w {
+        for y in area.top()..area.bottom() {
+            if let Some(dst) = buf.cell_mut(Position::new(area.x + list_w, y)) {
+                dst.set_symbol("│");
+                dst.set_style(Style::default().fg(palette.dim));
+            }
+        }
+    }
+}
+
+/// The session list beside the attached session, focused while the client
+/// is in switcher mode.
+fn render_with_sidebar(
+    client: &mut Client,
+    sessions: &mut BTreeMap<SessionId, Session>,
+    hosts: &BTreeMap<HostId, Host>,
+    config: &Config,
+    width: u16,
+) {
+    let entries = switcher_entries(sessions);
+    let focused = client.switcher.is_some();
+    let highlight = client
+        .switcher
+        .or_else(|| sessions.keys().position(|&sid| sid == client.attached))
+        .unwrap_or(0)
+        .min(entries.len().saturating_sub(1));
+    let Client {
+        terminal,
+        new_session,
+        host_choice,
+        colors,
+        attached,
+        ..
+    } = client;
+    let Some(session) = sessions.get_mut(attached) else {
+        return;
+    };
+    let palette = &config.palette;
+    let _ = session.draw_frame(terminal, !focused, |buf| {
+        let area = *buf.area();
+        let sidebar = Rect {
+            width: width.min(area.width),
+            ..area
+        };
+        clear_region(buf, sidebar);
+        render_session_list(buf, sidebar, &entries, highlight, focused, palette, colors);
+        render_switcher_prompts(buf, area, new_session, host_choice, hosts, palette);
+    });
+}
+
 fn render_switcher(
     client: &mut Client,
     sessions: &mut BTreeMap<SessionId, Session>,
@@ -2104,27 +2322,9 @@ fn render_switcher(
     config: &Config,
 ) {
     let palette = &config.palette;
-    let pinned = pinned(sessions);
-    let mut entries: Vec<SwitcherEntry> = Vec::with_capacity(pinned + sessions.len());
-    if pinned > 0 {
-        entries.push(SwitcherEntry {
-            tag: None,
-            text: grid::ENTRY_NAME.to_string(),
-            urgency: None,
-            offline: false,
-        });
-    }
-    entries.extend(sessions.values().map(|s| SwitcherEntry {
-        tag: s.host.as_ref().map(|h| h.tag.clone()),
-        text: format!("{} ({} windows)", s.name, s.window_count()),
-        urgency: s.urgency().filter(|_| !s.is_offline()),
-        offline: s.is_offline(),
-    }));
+    let entries = switcher_entries(sessions);
     let highlight = highlight.min(entries.len().saturating_sub(1));
-    let highlighted_sid = highlight
-        .checked_sub(pinned)
-        .and_then(|i| sessions.keys().nth(i).copied());
-    let elapsed = anim::elapsed();
+    let highlighted_sid = sessions.keys().nth(highlight).copied();
     let Client {
         terminal,
         new_session,
@@ -2133,62 +2333,12 @@ fn render_switcher(
         ..
     } = client;
     let colors = *colors;
-    let default_bg = colors
-        .bg
-        .map_or(palette.bg, |(r, g, b)| Color::Rgb(r, g, b));
     let _ = terminal.draw(|frame| {
         let area = frame.area();
         let buf = frame.buffer_mut();
         clear_region(buf, area);
         let list_w = SWITCHER_LIST_WIDTH.min(area.width);
-        for (i, entry) in entries.iter().enumerate() {
-            let y = area.y + 1 + i as u16;
-            if y >= area.bottom() {
-                break;
-            }
-            let urgency = entry.urgency;
-            let (base, modifier) = match (i == highlight, entry.offline) {
-                (true, false) => (palette.accent, Modifier::REVERSED),
-                (true, true) => (palette.dim, Modifier::REVERSED),
-                (false, false) => (palette.text, Modifier::empty()),
-                (false, true) => (palette.dim, Modifier::empty()),
-            };
-            let (color, anim) = urgency.map_or((base, Anim::None), |urgency| {
-                let (status, anim) = urgency.visual();
-                (palette.status(status), anim)
-            });
-            let tag = entry
-                .tag
-                .as_ref()
-                .map_or(String::new(), |t| format!("{t} "));
-            let tag_len = tag.chars().count();
-            let text = format!(" {tag}{} ", entry.text);
-            let len = text.chars().count();
-            for (j, ch) in text.chars().enumerate() {
-                let x = area.x + j as u16;
-                if x >= area.x + list_w {
-                    break;
-                }
-                let in_tag = (1..=tag_len).contains(&j);
-                let fg = match anim {
-                    _ if in_tag && !entry.offline => palette.muted,
-                    Anim::None => color,
-                    Anim::Shimmer => anim::shimmer(color, j, len, elapsed),
-                    Anim::Breathe => anim::breathe(color, elapsed),
-                };
-                // Explicit colors, since some terminals reverse a default
-                // background into the default foreground.
-                let style = if i == highlight && urgency.is_some() {
-                    Style::default().fg(default_bg).bg(fg)
-                } else {
-                    Style::default().fg(fg).add_modifier(modifier)
-                };
-                if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
-                    dst.set_char(ch);
-                    dst.set_style(style);
-                }
-            }
-        }
+        render_session_list(buf, area, &entries, highlight, true, palette, &colors);
         // The menu icon, which exits on click.
         if area.height > 0
             && let Some(dst) = buf.cell_mut(Position::new(area.x, area.bottom() - 1))
@@ -2197,20 +2347,12 @@ fn render_switcher(
             dst.set_style(Style::default().fg(palette.accent));
         }
         if area.width > list_w {
-            for y in area.top()..area.bottom() {
-                if let Some(dst) = buf.cell_mut(Position::new(area.x + list_w, y)) {
-                    dst.set_symbol("│");
-                    dst.set_style(Style::default().fg(palette.dim));
-                }
-            }
             let preview = Rect {
                 x: area.x + list_w + 1,
                 width: area.width - list_w - 1,
                 ..area
             };
-            if pinned > 0 && highlight == 0 {
-                grid::render_preview(buf, preview, sessions, palette);
-            } else if let Some(session) = highlighted_sid.and_then(|sid| sessions.get_mut(&sid)) {
+            if let Some(session) = highlighted_sid.and_then(|sid| sessions.get_mut(&sid)) {
                 session.render_preview(buf, preview);
             }
         }
@@ -2223,65 +2365,75 @@ fn render_switcher(
             };
             palette::shadow(buf, panel, area, palette, &colors);
         }
-        // The prompt takes the bottom row, where the command line lives.
-        if let Some(prompt) = new_session.as_ref()
-            && area.height > 0
-        {
-            let label = NEW_SESSION_LABEL;
-            let label_len = label.chars().count() as u16;
-            if area.width <= label_len {
-                return;
-            }
-            let line = Rect::new(area.x, area.bottom() - 1, area.width, 1);
-            clear_region(buf, line);
-            for (i, ch) in label.chars().enumerate() {
-                if let Some(dst) = buf.cell_mut(Position::new(line.x + i as u16, line.y)) {
-                    dst.set_char(ch);
-                }
-            }
-            let input = Rect {
-                x: line.x + label_len,
-                width: line.width - label_len,
-                ..line
-            };
-            prompt.render(input, buf);
-        }
-        if let Some(choice) = host_choice.as_ref()
-            && area.height > 0
-        {
-            let line = Rect::new(area.x, area.bottom() - 1, area.width, 1);
-            clear_region(buf, line);
-            let mut x = line.x;
-            let mut put = |text: &str, style: Style| {
-                for ch in text.chars() {
-                    if x >= line.right() {
-                        return;
-                    }
-                    if let Some(dst) = buf.cell_mut(Position::new(x, line.y)) {
-                        dst.set_char(ch);
-                        dst.set_style(style);
-                    }
-                    x += 1;
-                }
-            };
-            put(HOST_CHOICE_LABEL, Style::default());
-            for (i, host) in choice.hosts.iter().enumerate() {
-                let name = match host {
-                    Some(id) => hosts.get(id).map_or("?", |h| h.alias.as_str()),
-                    None => session::hostname(),
-                };
-                let style = if i == choice.highlight {
-                    Style::default()
-                        .fg(palette.accent)
-                        .add_modifier(Modifier::REVERSED)
-                } else {
-                    Style::default().fg(palette.text)
-                };
-                put(&format!(" {name} "), style);
-                put(" ", Style::default());
-            }
-        }
+        render_switcher_prompts(buf, area, new_session, host_choice, hosts, palette);
     });
+}
+
+/// The new-session prompt or host choice, on the bottom row where the
+/// command line lives.
+fn render_switcher_prompts(
+    buf: &mut Buffer,
+    area: Rect,
+    new_session: &Option<TextArea<'static>>,
+    host_choice: &Option<HostChoice>,
+    hosts: &BTreeMap<HostId, Host>,
+    palette: &palette::Palette,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let line = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+    if let Some(prompt) = new_session.as_ref() {
+        let label = NEW_SESSION_LABEL;
+        let label_len = label.chars().count() as u16;
+        if area.width <= label_len {
+            return;
+        }
+        clear_region(buf, line);
+        for (i, ch) in label.chars().enumerate() {
+            if let Some(dst) = buf.cell_mut(Position::new(line.x + i as u16, line.y)) {
+                dst.set_char(ch);
+            }
+        }
+        let input = Rect {
+            x: line.x + label_len,
+            width: line.width - label_len,
+            ..line
+        };
+        prompt.render(input, buf);
+    }
+    if let Some(choice) = host_choice.as_ref() {
+        clear_region(buf, line);
+        let mut x = line.x;
+        let mut put = |text: &str, style: Style| {
+            for ch in text.chars() {
+                if x >= line.right() {
+                    return;
+                }
+                if let Some(dst) = buf.cell_mut(Position::new(x, line.y)) {
+                    dst.set_char(ch);
+                    dst.set_style(style);
+                }
+                x += 1;
+            }
+        };
+        put(HOST_CHOICE_LABEL, Style::default());
+        for (i, host) in choice.hosts.iter().enumerate() {
+            let name = match host {
+                Some(id) => hosts.get(id).map_or("?", |h| h.alias.as_str()),
+                None => session::hostname(),
+            };
+            let style = if i == choice.highlight {
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(palette.text)
+            };
+            put(&format!(" {name} "), style);
+            put(" ", Style::default());
+        }
+    }
 }
 
 const NEW_SESSION_LABEL: &str = "new session: ";
@@ -2289,13 +2441,6 @@ const NEW_SESSION_LABEL: &str = "new session: ";
 const HOST_CHOICE_LABEL: &str = "run on: ";
 
 const AT_IN_NAME: &str = "session names cannot contain '@'";
-
-fn pinned(sessions: &BTreeMap<SessionId, Session>) -> usize {
-    sessions
-        .values()
-        .filter(|s| !s.is_remote())
-        .any(Session::has_agent_tab) as usize
-}
 
 pub(crate) fn clear_region(buf: &mut Buffer, area: Rect) {
     for y in area.top()..area.bottom() {

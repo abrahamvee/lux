@@ -1,5 +1,14 @@
 # News
 
+## 2026-09-24
+
+- `sidebar = true` keeps the session list visible at the left; prefix+`s`
+  focuses it and `Esc` returns to your window.
+- `:config-set <key> <value>` writes one config key and reloads, leaving
+  the file alone if the value is invalid.
+- `lux ls` also lists connected hosts' sessions as `name@alias`.
+- The switcher no longer lists CLAUDECOM; prefix+`g` opens it.
+
 ## 2026-09-23
 
 - All new-session paths prompt for remote host when a remote session is

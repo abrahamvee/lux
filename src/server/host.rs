@@ -380,7 +380,8 @@ impl Server {
             self.finish_attach(conn, sid);
             return;
         }
-        self.request_session(conn, host, name, Rect::new(0, 0, size.width, size.height));
+        let area = super::session_area(&self.config, size);
+        self.request_session(conn, host, name, area);
     }
 
     fn finish_attach(&mut self, conn: ConnId, sid: SessionId) {
@@ -764,7 +765,7 @@ impl Server {
         for client in self.clients.values().filter(|c| c.attached == sid) {
             let size = term::fd_size(&client.raw_out);
             if let Some(session) = self.sessions.get_mut(&sid) {
-                session.set_area(Rect::new(0, 0, size.width, size.height));
+                session.set_area(super::session_area(&self.config, size));
             }
         }
         Some(sid)
@@ -772,8 +773,10 @@ impl Server {
 
     fn client_area(&self) -> Option<Rect> {
         let client = self.clients.values().next()?;
-        let size = term::fd_size(&client.raw_out);
-        Some(Rect::new(0, 0, size.width, size.height))
+        Some(super::session_area(
+            &self.config,
+            term::fd_size(&client.raw_out),
+        ))
     }
 
     fn remote_sid(&self, host: HostId, remote: RemoteSessionId) -> Option<SessionId> {
@@ -825,7 +828,7 @@ impl Server {
             .get(&conn)
             .map(|c| term::fd_size(&c.raw_out))
             .map_or(Rect::new(0, 0, 80, 24), |s| {
-                Rect::new(0, 0, s.width, s.height)
+                super::session_area(&self.config, s)
             });
         self.request_session(conn, host, name, area);
     }

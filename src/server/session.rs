@@ -65,6 +65,8 @@ pub enum Effect {
     KillSession(Option<String>),
     /// Re-read the config file and apply it to every session.
     ReloadConfig,
+    /// Write one key to the config file, then apply it like a reload.
+    SetConfig(String, String),
     /// Adopt a host's sessions by ssh alias.
     Connect(String),
     Disconnect(String),
@@ -889,12 +891,6 @@ impl Session {
         self.windows.len()
     }
 
-    pub fn has_agent_tab(&self) -> bool {
-        self.windows
-            .values()
-            .any(|w| w.tabs.iter().any(|t| t.agent.is_some()))
-    }
-
     /// In layout order, then tab order.
     pub fn agent_tabs(&self) -> Vec<(WindowId, usize)> {
         let mut out = Vec::new();
@@ -1596,6 +1592,9 @@ impl Session {
                         }
                         Some(ExCommand::ConfigOpen) => self.open_config(),
                         Some(ExCommand::ConfigReload) => return Some(Effect::ReloadConfig),
+                        Some(ExCommand::ConfigSet(key, value)) => {
+                            return Some(Effect::SetConfig(key, value));
+                        }
                         Some(ExCommand::Connect(alias)) => return Some(Effect::Connect(alias)),
                         Some(ExCommand::Disconnect(alias)) => {
                             return Some(Effect::Disconnect(alias));
@@ -2242,9 +2241,19 @@ impl Session {
             })
     }
 
-    pub fn draw_frame(&mut self, tui: &mut Terminal<FdBackend>) -> anyhow::Result<()> {
+    /// `overlay` draws over the session's frame, where the session's area
+    /// leaves room.
+    pub fn draw_frame(
+        &mut self,
+        tui: &mut Terminal<FdBackend>,
+        cursor: bool,
+        overlay: impl FnOnce(&mut Buffer),
+    ) -> anyhow::Result<()> {
         self.compute_view();
-        tui.draw(|frame| self.render(frame))?;
+        tui.draw(|frame| {
+            self.render(frame, cursor);
+            overlay(frame.buffer_mut());
+        })?;
         self.force_redraw = false;
         for win in self.windows.values_mut() {
             let tab = win.active_tab_mut();
@@ -2256,7 +2265,7 @@ impl Session {
     /// Unlike `draw_frame`, leaves the seqno bookkeeping alone.
     pub fn render_preview(&mut self, buf: &mut Buffer, area: Rect) {
         self.compute_view();
-        let full = Rect::new(0, 0, self.area.width, self.area.height);
+        let full = self.area;
         if full.width == 0 || full.height == 0 {
             return;
         }
@@ -2266,7 +2275,7 @@ impl Session {
             for x in 0..area.width.min(full.width) {
                 if let (Some(dst), Some(src)) = (
                     buf.cell_mut(Position::new(area.x + x, area.y + y)),
-                    tmp.cell(Position::new(x, y)),
+                    tmp.cell(Position::new(full.x + x, full.y + y)),
                 ) {
                     *dst = src.clone();
                 }
@@ -2607,10 +2616,10 @@ impl Session {
         }
     }
 
-    fn render(&mut self, frame: &mut Frame) {
+    fn render(&mut self, frame: &mut Frame, cursor: bool) {
         self.render_to_buffer(frame.buffer_mut());
         // The prompt's textarea draws its own cursor.
-        if self.prompt.is_some() {
+        if self.prompt.is_some() || !cursor {
             return;
         }
         // The cursor has no settled cell while the focused window is still

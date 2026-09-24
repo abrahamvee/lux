@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub const COMMANDS: &[&str] = &[
     "config-open",
     "config-reload",
+    "config-set",
     "connect",
     "disconnect",
     "kill-session",
@@ -30,6 +31,8 @@ pub enum ExCommand {
     ConfigOpen,
     /// Re-read the config file and apply it to every session.
     ConfigReload,
+    /// Write one key to the config file, then reload it.
+    ConfigSet(String, String),
     /// Adopt the sessions of the host at this ssh alias.
     Connect(String),
     Disconnect(String),
@@ -52,6 +55,15 @@ pub fn parse(text: &str) -> Option<ExCommand> {
             }
             if let Some(name) = arg(text, "kill-session") {
                 return Some(ExCommand::KillSession(Some(name.to_string())));
+            }
+            if let Some(args) = arg(text, "config-set") {
+                let mut words = args.split_whitespace();
+                return match (words.next(), words.next(), words.next()) {
+                    (Some(key), Some(value), None) => {
+                        Some(ExCommand::ConfigSet(key.into(), value.into()))
+                    }
+                    _ => None,
+                };
             }
             if let Some(alias) = arg(text, "connect") {
                 return Some(ExCommand::Connect(alias.to_string()));
@@ -126,6 +138,17 @@ mod tests {
     }
 
     #[test]
+    fn config_set_takes_exactly_a_key_and_a_value() {
+        assert_eq!(
+            parse("config-set sidebar true"),
+            Some(ExCommand::ConfigSet("sidebar".into(), "true".into()))
+        );
+        assert_eq!(parse("config-set sidebar"), None);
+        assert_eq!(parse("config-set"), None);
+        assert_eq!(parse("config-set a b c"), None);
+    }
+
+    #[test]
     fn unrecognized_text_parses_to_none() {
         assert_eq!(parse(""), None);
         assert_eq!(parse("vsp"), None);
@@ -147,6 +170,7 @@ mod tests {
             vec![
                 "config-open",
                 "config-reload",
+                "config-set",
                 "connect",
                 "disconnect",
                 "kill-session",
@@ -162,7 +186,10 @@ mod tests {
         assert_eq!(suggestions("new"), vec!["new", "new-session"]);
         assert_eq!(suggestions("rename"), vec!["rename-session"]);
         assert_eq!(suggestions("kill"), vec!["kill-session"]);
-        assert_eq!(suggestions("config"), vec!["config-open", "config-reload"]);
+        assert_eq!(
+            suggestions("config"),
+            vec!["config-open", "config-reload", "config-set"]
+        );
         assert_eq!(suggestions("w"), vec!["w"]);
         assert_eq!(suggestions("w /tmp"), Vec::<&str>::new());
         assert_eq!(suggestions("x"), Vec::<&str>::new());

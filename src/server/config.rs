@@ -57,11 +57,13 @@ pub struct Config {
     pub dim_unfocused: bool,
     /// Popovers cast a shadow on the content beneath them.
     pub shadows: bool,
-    /// Animate splits, window removal, and maximize.
+    /// Animate maximize.
     pub layout_transitions: bool,
     /// Reveal the first frame gradually after a client attaches.
     pub attach_transition: bool,
     pub attach_style: AttachStyle,
+    /// Keep the session list visible beside the layout.
+    pub sidebar: bool,
 }
 
 impl Default for Config {
@@ -80,6 +82,7 @@ impl Default for Config {
             layout_transitions: true,
             attach_transition: true,
             attach_style: AttachStyle::default(),
+            sidebar: false,
         }
     }
 }
@@ -110,96 +113,149 @@ pub fn reload() -> Result<Config, String> {
         // No config file is not an error.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(err) => Err(format!("{}: {err}", path.display())),
-        Ok(text) => parse(&text, &path.display().to_string()),
+        Ok(text) => {
+            let (config, invalid) = parse(&text, &path.display().to_string())?;
+            for (_, message) in invalid {
+                eprintln!("lux: {message}");
+            }
+            Ok(config)
+        }
     }
 }
 
-fn parse(text: &str, origin: &str) -> Result<Config, String> {
+/// Writes `key = value` to the file, creating it if needed, and returns
+/// the config it now holds. The file is left alone if the result wouldn't
+/// parse or the value isn't valid for the key.
+pub fn set(key: &str, value: &str) -> Result<Config, String> {
+    if !KEYS.contains(&key) {
+        return Err(format!("unknown config key {key}"));
+    }
+    let path = path().ok_or("no config path: HOME is unset")?;
+    let origin = path.display().to_string();
+    let text = match std::fs::read_to_string(&path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(format!("{origin}: {err}")),
+        Ok(text) => text,
+    };
+    let text = with_key(&text, key, &parse_value(value));
+    let (config, invalid) = parse(&text, &origin)?;
+    if let Some((_, message)) = invalid.iter().find(|(k, _)| *k == key) {
+        return Err(message.clone());
+    }
+    for (_, message) in invalid {
+        eprintln!("lux: {message}");
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    }
+    std::fs::write(&path, text).map_err(|err| format!("{origin}: {err}"))?;
+    Ok(config)
+}
+
+/// A TOML literal as written, or else a bare string.
+fn parse_value(text: &str) -> toml::Value {
+    toml::from_str::<toml::Table>(&format!("v = {text}"))
+        .ok()
+        .and_then(|mut table| table.remove("v"))
+        .unwrap_or_else(|| toml::Value::String(text.into()))
+}
+
+/// Replaces the top-level line for `key`, or adds one ahead of the first
+/// table.
+fn with_key(text: &str, key: &str, value: &toml::Value) -> String {
+    let line = format!("{key} = {value}");
+    let mut lines: Vec<&str> = text.lines().collect();
+    let top_end = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+    let existing = lines[..top_end].iter().position(|l| {
+        l.trim_start()
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    });
+    match existing {
+        Some(i) => lines[i] = &line,
+        None => {
+            let mut at = top_end;
+            while at > 0 && lines[at - 1].trim().is_empty() {
+                at -= 1;
+            }
+            lines.insert(at, &line);
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Every top-level key the file may set.
+const KEYS: &[&str] = &[
+    "prefix",
+    "restore",
+    "notify",
+    "automode",
+    "copy-on-select",
+    "osc-titles",
+    "rule-style",
+    "palette",
+    "dim-unfocused",
+    "shadows",
+    "layout-transitions",
+    "attach-transition",
+    "attach-style",
+    "sidebar",
+];
+
+/// A key whose value was skipped, and why.
+type Invalid = (&'static str, String);
+
+/// Invalid values are skipped, each reported with its key.
+fn parse(text: &str, origin: &str) -> Result<(Config, Vec<Invalid>), String> {
     let doc: toml::Table = toml::from_str(text).map_err(|err| format!("{origin}: {err}"))?;
     let mut config = Config::default();
-    if let Some(value) = doc.get("prefix") {
-        match value.as_str().and_then(parse_key_spec) {
-            Some(key) => config.keys.set_prefix(key),
-            None => eprintln!("lux: {origin}: invalid prefix key {value}"),
+    let mut invalid = Vec::new();
+    for &key in KEYS {
+        if let Some(value) = doc.get(key)
+            && !apply(&mut config, key, value)
+        {
+            invalid.push((key, format!("{origin}: invalid {key} value {value}")));
         }
     }
-    if let Some(value) = doc.get("restore") {
-        match value.as_bool() {
-            Some(restore) => config.restore = restore,
-            None => eprintln!("lux: {origin}: invalid restore value {value}"),
-        }
-    }
-    if let Some(value) = doc.get("notify") {
-        match value.as_bool() {
-            Some(notify) => config.notify = notify,
-            None => eprintln!("lux: {origin}: invalid notify value {value}"),
-        }
-    }
-    if let Some(value) = doc.get("automode") {
-        match value.as_bool() {
-            Some(automode) => config.automode = automode,
-            None => eprintln!("lux: {origin}: invalid automode value {value}"),
-        }
-    }
-    if let Some(value) = doc.get("copy-on-select") {
-        match value.as_bool() {
-            Some(copy) => config.copy_on_select = copy,
-            None => eprintln!("lux: {origin}: invalid copy-on-select value {value}"),
-        }
-    }
-    if let Some(value) = doc.get("osc-titles") {
-        match value.as_str() {
-            Some("none") => config.osc_titles = OscTitles::None,
-            Some("agents") => config.osc_titles = OscTitles::Agents,
-            Some("all") => config.osc_titles = OscTitles::All,
-            _ => eprintln!("lux: {origin}: invalid osc-titles value {value}"),
-        }
-    }
-    if let Some(value) = doc.get("rule-style") {
-        match value.as_str() {
-            Some("rule") => config.rule_style = RuleStyle::Rule,
-            Some("dots") => config.rule_style = RuleStyle::Dots,
-            _ => eprintln!("lux: {origin}: invalid rule-style value {value}"),
-        }
-    }
-    if let Some(value) = doc.get("palette") {
-        match value.as_str().and_then(Palette::named) {
+    Ok((config, invalid))
+}
+
+/// False when the value isn't valid for the key.
+fn apply(config: &mut Config, key: &str, value: &toml::Value) -> bool {
+    let flag = |field: &mut bool| value.as_bool().map(|b| *field = b).is_some();
+    match (key, value.as_str()) {
+        ("prefix", spec) => match spec.and_then(parse_key_spec) {
+            Some(prefix) => config.keys.set_prefix(prefix),
+            None => return false,
+        },
+        ("restore", _) => return flag(&mut config.restore),
+        ("notify", _) => return flag(&mut config.notify),
+        ("automode", _) => return flag(&mut config.automode),
+        ("copy-on-select", _) => return flag(&mut config.copy_on_select),
+        ("dim-unfocused", _) => return flag(&mut config.dim_unfocused),
+        ("shadows", _) => return flag(&mut config.shadows),
+        ("layout-transitions", _) => return flag(&mut config.layout_transitions),
+        ("attach-transition", _) => return flag(&mut config.attach_transition),
+        ("sidebar", _) => return flag(&mut config.sidebar),
+        ("osc-titles", Some("none")) => config.osc_titles = OscTitles::None,
+        ("osc-titles", Some("agents")) => config.osc_titles = OscTitles::Agents,
+        ("osc-titles", Some("all")) => config.osc_titles = OscTitles::All,
+        ("rule-style", Some("rule")) => config.rule_style = RuleStyle::Rule,
+        ("rule-style", Some("dots")) => config.rule_style = RuleStyle::Dots,
+        ("palette", name) => match name.and_then(Palette::named) {
             Some(palette) => config.palette = palette,
-            None => eprintln!("lux: {origin}: unknown palette {value}"),
-        }
+            None => return false,
+        },
+        ("attach-style", Some("coalesce")) => config.attach_style = AttachStyle::Coalesce,
+        ("attach-style", Some("rain")) => config.attach_style = AttachStyle::Rain,
+        _ => return false,
     }
-    if let Some(value) = doc.get("dim-unfocused") {
-        match value.as_bool() {
-            Some(dim) => config.dim_unfocused = dim,
-            None => eprintln!("lux: {origin}: invalid dim-unfocused value {value}"),
-        }
-    }
-    if let Some(value) = doc.get("shadows") {
-        match value.as_bool() {
-            Some(shadows) => config.shadows = shadows,
-            None => eprintln!("lux: {origin}: invalid shadows value {value}"),
-        }
-    }
-    if let Some(value) = doc.get("layout-transitions") {
-        match value.as_bool() {
-            Some(animate) => config.layout_transitions = animate,
-            None => eprintln!("lux: {origin}: invalid layout-transitions value {value}"),
-        }
-    }
-    if let Some(value) = doc.get("attach-transition") {
-        match value.as_bool() {
-            Some(animate) => config.attach_transition = animate,
-            None => eprintln!("lux: {origin}: invalid attach-transition value {value}"),
-        }
-    }
-    if let Some(value) = doc.get("attach-style") {
-        match value.as_str() {
-            Some("coalesce") => config.attach_style = AttachStyle::Coalesce,
-            Some("rain") => config.attach_style = AttachStyle::Rain,
-            _ => eprintln!("lux: {origin}: invalid attach-style value {value}"),
-        }
-    }
-    Ok(config)
+    true
 }
 
 /// A single character, optionally prefixed with `C-` for Ctrl.
@@ -225,7 +281,7 @@ mod tests {
     use super::*;
 
     fn from_toml(text: &str, origin: &str) -> Config {
-        parse(text, origin).unwrap_or_default()
+        parse(text, origin).map(|(c, _)| c).unwrap_or_default()
     }
 
     fn table(text: &str) -> KeyTable {
@@ -347,6 +403,56 @@ mod tests {
         assert_eq!(parse("attach-style = \"coalesce\""), AttachStyle::Coalesce);
         assert_eq!(parse("attach-style = \"snow\""), AttachStyle::Rain);
         assert_eq!(parse("attach-style = true"), AttachStyle::Rain);
+    }
+
+    #[test]
+    fn sidebar_option_parses_and_defaults_off() {
+        assert!(!from_toml("", "test").sidebar);
+        assert!(from_toml("sidebar = true", "test").sidebar);
+        assert!(!from_toml("sidebar = false", "test").sidebar);
+        assert!(!from_toml("sidebar = \"yes\"", "test").sidebar);
+    }
+
+    #[test]
+    fn invalid_values_are_reported_by_key() {
+        let (_, invalid) = parse("shadows = 1\nnotify = false\nrule-style = \"x\"", "t").unwrap();
+        let keys: Vec<&str> = invalid.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec!["rule-style", "shadows"]);
+    }
+
+    #[test]
+    fn set_values_parse_as_toml_or_fall_back_to_strings() {
+        assert_eq!(parse_value("false"), toml::Value::Boolean(false));
+        assert_eq!(parse_value("rain"), toml::Value::String("rain".into()));
+        assert_eq!(parse_value("\"C-a\""), toml::Value::String("C-a".into()));
+        assert_eq!(parse_value("C-a"), toml::Value::String("C-a".into()));
+    }
+
+    #[test]
+    fn with_key_replaces_a_top_level_line_in_place() {
+        let text = "# mine\nshadows = false # off\nnotify = true\n";
+        assert_eq!(
+            with_key(text, "shadows", &toml::Value::Boolean(true)),
+            "# mine\nshadows = true\nnotify = true\n"
+        );
+    }
+
+    #[test]
+    fn with_key_adds_missing_keys_ahead_of_tables() {
+        let bool = toml::Value::Boolean(true);
+        assert_eq!(with_key("", "sidebar", &bool), "sidebar = true\n");
+        assert_eq!(
+            with_key(
+                "notify = true\n\n[keys]\nsidebar = false\n",
+                "sidebar",
+                &bool
+            ),
+            "notify = true\nsidebar = true\n\n[keys]\nsidebar = false\n"
+        );
+        assert_eq!(
+            with_key("shadows-extra = 1\n", "shadows", &bool),
+            "shadows-extra = 1\nshadows = true\n"
+        );
     }
 
     #[test]

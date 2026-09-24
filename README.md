@@ -35,7 +35,7 @@ lux new-session -s <name>
 lux -t <name>          # same; -t is kept for tmux muscle memory
 lux attach -t <name>
 lux attach             # reattach to the most recently attached session
-lux ls                 # list sessions
+lux ls                 # list sessions, including name@alias for connected hosts
 lux kill-server        # stop the server and all sessions
 ```
 
@@ -105,6 +105,9 @@ Ex commands (typed after `:`, with autocomplete):
   without an argument
 - `:config-open` — open the config file in a new tab running `$EDITOR`
 - `:config-reload` — re-read the config file and apply it to every session
+- `:config-set <key> <value>` — write one key to the config file (creating
+  it if needed) and reload; an unknown key or invalid value leaves the file
+  unchanged
 
 ### Navigating sessions
 
@@ -116,6 +119,11 @@ the name empty to auto-name it; a taken name returns to the switcher).
 Clicking the `☢` icon at the left of the status bar opens it too; while
 the switcher is open the icon shows as `○`, and clicking it exits.
 
+With `sidebar = true`, the session list stays visible at the left instead.
+Prefix+`s` moves focus into it, where the same keys move the highlight,
+`Enter` attaches, and `Esc` returns focus to your window. Clicking an entry
+attaches at any time.
+
 Prefix+`f` opens the fuzzy tab finder: a popover over your session
 listing every tab across every session, narrowing as you type a query,
 with a live preview of the highlighted match. Move the highlight with
@@ -124,11 +132,9 @@ tab's home session, window, and tab; `Esc` cancels.
 
 ### CLAUDECOM
 
-While any tab runs Claude Code, the switcher pins a **CLAUDECOM** entry
-at the top: a live grid with one tile per Claude Code tab across every
-session, each showing status text, home session name, tab name, and
-content resized to fit the tile. Prefix+`g` jumps straight to the grid
-without opening the switcher.
+Prefix+`g` opens **CLAUDECOM**: a live grid with one tile per agent tab
+across every session, each showing status text, home session name, tab
+name, and content resized to fit the tile.
 
 In the grid: move the highlight with `h`/`j`/`k`/`l` or the arrow keys
 (overflow rows scroll with it); `Enter` captures the highlighted tile for
@@ -140,9 +146,8 @@ from.
 
 ### Auto mode
 
-With `automode = true` (see Configuration), both of CLAUDECOM's entry
-points — prefix+`g` and selecting CLAUDECOM from the switcher — open auto
-mode instead of the grid. Auto mode attaches you to one agent tab that's
+With `automode = true` (see Configuration), prefix+`g` opens auto mode
+instead of the grid. Auto mode attaches you to one agent tab that's
 done or blocked at a time. Once that tab starts working again or goes
 away, it hands off automatically to the next such tab, in the same order
 the grid uses. Prefix+`Tab` skips to the next one manually. When no tab
@@ -152,7 +157,8 @@ now" — with a list of tabs still working or waiting underneath.
 ## Configuration
 
 Lux reads `$XDG_CONFIG_HOME/lux/config.toml` (falling back to
-`~/.config/lux/config.toml`) at startup and again on `:config-reload`. A
+`~/.config/lux/config.toml`) at startup and again on `:config-reload` or
+`:config-set`. A
 missing file is fine. A malformed one prints an error to stderr: at startup
 lux falls back to defaults, and on reload every session keeps the settings
 it has. The keybinding table itself is not configurable:
@@ -172,6 +178,7 @@ shadows = true           # popovers cast a shadow on the content beneath
 layout-transitions = false  # snap maximize into place
 attach-transition = false   # draw the first frame after attaching at once
 attach-style = "coalesce"   # how the first frame after attaching appears
+sidebar = true              # keep the session list visible at the left
 ```
 
 The prefix key spec is a single character, optionally prefixed with `C-`
