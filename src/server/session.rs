@@ -354,8 +354,6 @@ pub struct SessionHost {
     pub id: HostId,
     pub link: HostLink,
     pub remote: RemoteSessionId,
-    /// The alias, cut to the switcher tag's width.
-    pub tag: String,
     /// The layout the host last heard of.
     pub synced: Option<LayoutSnap>,
 }

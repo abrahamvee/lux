@@ -118,6 +118,8 @@ preview. Move the highlight with `j`/`k`, the arrow keys, or readline-style
 the name empty to auto-name it; a taken name returns to the switcher).
 Clicking the `☢` icon at the left of the status bar opens it too; while
 the switcher is open the icon shows as `○`, and clicking it exits.
+Sessions on a connected host (see `:connect`) follow this host's, grouped
+under a heading naming the host.
 
 With `sidebar = true`, the session list stays visible at the left instead.
 Prefix+`s` moves focus into it, where the same keys move the highlight,
@@ -125,8 +127,9 @@ Prefix+`s` moves focus into it, where the same keys move the highlight,
 attaches at any time.
 
 Prefix+`f` opens the fuzzy tab finder: a popover over your session
-listing every tab across every session, narrowing as you type a query,
-with a live preview of the highlighted match. Move the highlight with
+listing every tab across every session, grouped under a heading per
+session, narrowing as you type a query, with a live preview of the
+highlighted match. Move the highlight with
 `Ctrl-n`/`Ctrl-p` or the arrow keys; `Enter` jumps to the highlighted
 tab's home session, window, and tab; `Esc` cancels.
 

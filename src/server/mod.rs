@@ -1389,7 +1389,7 @@ impl Server {
         client.switcher = None;
         client.new_session = None;
         client.auto = None;
-        let Some(&target) = self.sessions.keys().nth(highlight) else {
+        let Some(&target) = switcher_order(&self.sessions).get(highlight) else {
             return;
         };
         let current = client.attached;
@@ -1415,14 +1415,13 @@ impl Server {
     }
 
     fn switcher_entry_at(&self, conn: ConnId, column: u16, row: u16) -> Option<usize> {
-        let count = self.sessions.len();
         let client = self.clients.get(&conn)?;
         let size = term::fd_size(&client.raw_out);
         if column >= SWITCHER_LIST_WIDTH.min(size.width) || row < 1 {
             return None;
         }
-        let index = (row - 1) as usize;
-        (index < count).then_some(index)
+        let rows = switcher_rows(&self.sessions, &self.hosts);
+        session_at_row(&rows, (row - 1) as usize)
     }
 
     fn finder_input(&mut self, conn: ConnId, event: &DecodedInput) {
@@ -1445,7 +1444,7 @@ impl Server {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        let items = find::items(&self.sessions);
+        let items = find::items(&self.sessions, &self.hosts);
         let Some(client) = self.clients.get_mut(&conn) else {
             return;
         };
@@ -1500,7 +1499,7 @@ impl Server {
     }
 
     fn finder_paste(&mut self, conn: ConnId, text: String) {
-        let items = find::items(&self.sessions);
+        let items = find::items(&self.sessions, &self.hosts);
         let Some(client) = self.clients.get_mut(&conn) else {
             return;
         };
@@ -1778,7 +1777,10 @@ impl Server {
             return;
         };
         let sid = client.attached;
-        let highlight = self.sessions.keys().position(|&id| id == sid).unwrap_or(0);
+        let highlight = switcher_order(&self.sessions)
+            .iter()
+            .position(|&id| id == sid)
+            .unwrap_or(0);
         if let Some(client) = self.clients.get_mut(&conn) {
             client.grid = None;
             client.switcher = Some(highlight);
@@ -2069,7 +2071,7 @@ impl Server {
         for client in clients.values_mut() {
             let sidebar = sidebar_width(config, term::fd_size(&client.raw_out));
             if client.finder.is_some() {
-                render_finder(client, sessions, config);
+                render_finder(client, sessions, hosts, config);
             } else if client.grid.is_some() {
                 render_grid(client, sessions, &config.palette);
             } else if let Some(highlight) = client.switcher
@@ -2095,6 +2097,7 @@ impl Server {
 fn render_finder(
     client: &mut Client,
     sessions: &mut BTreeMap<SessionId, Session>,
+    hosts: &BTreeMap<HostId, Host>,
     config: &Config,
 ) {
     let Client {
@@ -2120,7 +2123,7 @@ fn render_finder(
                 }
             }
         }
-        find::render(buf, area, sessions, state, config, colors);
+        find::render(buf, area, sessions, hosts, state, config, colors);
     });
 }
 
@@ -2152,10 +2155,14 @@ fn render_grid(
 
 const SWITCHER_LIST_WIDTH: u16 = 28;
 
-/// One switcher row: the host tag, the text, its urgency, and whether its
-/// host is unreachable.
+/// A switcher row: a connected host's heading, or one of its sessions.
+enum SwitcherRow {
+    Heading { alias: String, offline: bool },
+    Session(SwitcherEntry),
+}
+
+/// A session's text, its urgency, and whether its host is unreachable.
 struct SwitcherEntry {
-    tag: Option<String>,
     text: String,
     urgency: Option<agent::Urgency>,
     offline: bool,
@@ -2182,25 +2189,65 @@ fn session_area(config: &Config, size: ratatui::layout::Size) -> Rect {
     Rect::new(x, 0, size.width - x, size.height)
 }
 
-fn switcher_entries(sessions: &BTreeMap<SessionId, Session>) -> Vec<SwitcherEntry> {
-    sessions
-        .values()
-        .map(|s| SwitcherEntry {
-            tag: s.host.as_ref().map(|h| h.tag.clone()),
+/// The switcher's sessions: this host's, then each connected host's,
+/// grouped. The switcher's highlight indexes this order.
+fn switcher_order(sessions: &BTreeMap<SessionId, Session>) -> Vec<SessionId> {
+    let mut order: Vec<(Option<HostId>, SessionId)> = sessions
+        .iter()
+        .map(|(&sid, s)| (s.host.as_ref().map(|h| h.id), sid))
+        .collect();
+    order.sort();
+    order.into_iter().map(|(_, sid)| sid).collect()
+}
+
+/// `switcher_order` with a heading ahead of each host's group.
+fn switcher_rows(
+    sessions: &BTreeMap<SessionId, Session>,
+    hosts: &BTreeMap<HostId, Host>,
+) -> Vec<SwitcherRow> {
+    let mut rows = Vec::with_capacity(sessions.len());
+    let mut group = None;
+    for sid in switcher_order(sessions) {
+        let s = &sessions[&sid];
+        let host = s.host.as_ref().map(|h| h.id);
+        if let Some(id) = host
+            && group != host
+        {
+            rows.push(SwitcherRow::Heading {
+                alias: hosts.get(&id).map_or("?".into(), |h| h.alias.clone()),
+                offline: s.is_offline(),
+            });
+        }
+        group = host;
+        rows.push(SwitcherRow::Session(SwitcherEntry {
             text: format!("{} ({} windows)", s.name, s.window_count()),
             urgency: s.urgency().filter(|_| !s.is_offline()),
             offline: s.is_offline(),
-        })
-        .collect()
+        }));
+    }
+    rows
 }
 
-/// One row per entry below a blank top row, with a divider on the right
-/// when `area` has room. An unfocused list marks its highlight in bold
-/// rather than reversed.
+/// The session at a row, by its place in `switcher_order`.
+fn session_at_row(rows: &[SwitcherRow], row: usize) -> Option<usize> {
+    match rows.get(row)? {
+        SwitcherRow::Heading { .. } => None,
+        SwitcherRow::Session(_) => Some(
+            rows[..row]
+                .iter()
+                .filter(|r| matches!(r, SwitcherRow::Session(_)))
+                .count(),
+        ),
+    }
+}
+
+/// One row each below a blank top row, with a divider on the right when
+/// `area` has room. An unfocused list marks its highlight in bold rather
+/// than reversed.
 fn render_session_list(
     buf: &mut Buffer,
     area: Rect,
-    entries: &[SwitcherEntry],
+    rows: &[SwitcherRow],
     highlight: usize,
     focused: bool,
     palette: &palette::Palette,
@@ -2216,11 +2263,32 @@ fn render_session_list(
         Modifier::BOLD
     };
     let list_w = SWITCHER_LIST_WIDTH.min(area.width);
-    for (i, entry) in entries.iter().enumerate() {
-        let y = area.y + 1 + i as u16;
+    let mut next = 0;
+    for (row, entry) in rows.iter().enumerate() {
+        let y = area.y + 1 + row as u16;
         if y >= area.bottom() {
             break;
         }
+        let entry = match entry {
+            SwitcherRow::Heading { alias, offline } => {
+                let color = if *offline { palette.dim } else { palette.muted };
+                let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+                for (j, ch) in format!(" {alias}").chars().enumerate() {
+                    let x = area.x + j as u16;
+                    if x >= area.x + list_w {
+                        break;
+                    }
+                    if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
+                        dst.set_char(ch);
+                        dst.set_style(style);
+                    }
+                }
+                continue;
+            }
+            SwitcherRow::Session(entry) => entry,
+        };
+        let i = next;
+        next += 1;
         let urgency = entry.urgency;
         let (base, modifier) = match (i == highlight, entry.offline) {
             (true, false) => (palette.accent, mark),
@@ -2232,21 +2300,14 @@ fn render_session_list(
             let (status, anim) = urgency.visual();
             (palette.status(status), anim)
         });
-        let tag = entry
-            .tag
-            .as_ref()
-            .map_or(String::new(), |t| format!("{t} "));
-        let tag_len = tag.chars().count();
-        let text = format!(" {tag}{} ", entry.text);
+        let text = format!(" {} ", entry.text);
         let len = text.chars().count();
         for (j, ch) in text.chars().enumerate() {
             let x = area.x + j as u16;
             if x >= area.x + list_w {
                 break;
             }
-            let in_tag = (1..=tag_len).contains(&j);
             let fg = match anim {
-                _ if in_tag && !entry.offline => palette.muted,
                 Anim::None => color,
                 Anim::Shimmer => anim::shimmer(color, j, len, elapsed),
                 Anim::Breathe => anim::breathe(color, elapsed),
@@ -2283,13 +2344,17 @@ fn render_with_sidebar(
     config: &Config,
     width: u16,
 ) {
-    let entries = switcher_entries(sessions);
+    let rows = switcher_rows(sessions, hosts);
     let focused = client.switcher.is_some();
     let highlight = client
         .switcher
-        .or_else(|| sessions.keys().position(|&sid| sid == client.attached))
+        .or_else(|| {
+            switcher_order(sessions)
+                .iter()
+                .position(|&sid| sid == client.attached)
+        })
         .unwrap_or(0)
-        .min(entries.len().saturating_sub(1));
+        .min(sessions.len().saturating_sub(1));
     let Client {
         terminal,
         new_session,
@@ -2309,7 +2374,7 @@ fn render_with_sidebar(
             ..area
         };
         clear_region(buf, sidebar);
-        render_session_list(buf, sidebar, &entries, highlight, focused, palette, colors);
+        render_session_list(buf, sidebar, &rows, highlight, focused, palette, colors);
         render_switcher_prompts(buf, area, new_session, host_choice, hosts, palette);
     });
 }
@@ -2322,9 +2387,9 @@ fn render_switcher(
     config: &Config,
 ) {
     let palette = &config.palette;
-    let entries = switcher_entries(sessions);
-    let highlight = highlight.min(entries.len().saturating_sub(1));
-    let highlighted_sid = sessions.keys().nth(highlight).copied();
+    let rows = switcher_rows(sessions, hosts);
+    let highlight = highlight.min(sessions.len().saturating_sub(1));
+    let highlighted_sid = switcher_order(sessions).get(highlight).copied();
     let Client {
         terminal,
         new_session,
@@ -2338,7 +2403,7 @@ fn render_switcher(
         let buf = frame.buffer_mut();
         clear_region(buf, area);
         let list_w = SWITCHER_LIST_WIDTH.min(area.width);
-        render_session_list(buf, area, &entries, highlight, true, palette, &colors);
+        render_session_list(buf, area, &rows, highlight, true, palette, &colors);
         // The menu icon, which exits on click.
         if area.height > 0
             && let Some(dst) = buf.cell_mut(Position::new(area.x, area.bottom() - 1))
@@ -2529,4 +2594,31 @@ fn osc52_copy(out: &mut File, text: &str) {
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let _ = write!(out, "\x1b]52;c;{encoded}\x07");
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> SwitcherRow {
+        SwitcherRow::Session(SwitcherEntry {
+            text: String::new(),
+            urgency: None,
+            offline: false,
+        })
+    }
+
+    fn heading() -> SwitcherRow {
+        SwitcherRow::Heading {
+            alias: "dev".into(),
+            offline: false,
+        }
+    }
+
+    #[test]
+    fn heading_rows_map_to_no_session() {
+        let rows = [session(), heading(), session(), session()];
+        let mapped: Vec<Option<usize>> = (0..5).map(|r| session_at_row(&rows, r)).collect();
+        assert_eq!(mapped, [Some(0), None, Some(1), Some(2), None]);
+    }
 }

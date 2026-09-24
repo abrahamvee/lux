@@ -10,6 +10,7 @@ use ratatui_textarea::TextArea;
 
 use crate::server::config::Config;
 use crate::server::grid;
+use crate::server::host::{Host, HostId};
 use crate::server::layout::WindowId;
 use crate::server::palette::{self, Palette};
 use crate::server::session::Session;
@@ -52,8 +53,11 @@ impl FinderState {
 }
 
 /// Every tab in every session, ordered by session name, then window and
-/// tab position.
-pub fn items(sessions: &BTreeMap<SessionId, Session>) -> Vec<FindItem> {
+/// tab position. A remote session is named `name@alias`.
+pub fn items(
+    sessions: &BTreeMap<SessionId, Session>,
+    hosts: &BTreeMap<HostId, Host>,
+) -> Vec<FindItem> {
     let mut by_name: Vec<(&str, SessionId)> = sessions
         .iter()
         .map(|(&sid, s)| (s.name.as_str(), sid))
@@ -62,6 +66,10 @@ pub fn items(sessions: &BTreeMap<SessionId, Session>) -> Vec<FindItem> {
     let mut out = Vec::new();
     for (name, sid) in by_name {
         let session = &sessions[&sid];
+        let name = match session.host.as_ref().and_then(|h| hosts.get(&h.id)) {
+            Some(host) => format!("{name}@{}", host.alias),
+            None => name.to_string(),
+        };
         for (window, tab) in session.all_tabs() {
             let Some(t) = session.tab_at(window, tab) else {
                 continue;
@@ -72,15 +80,16 @@ pub fn items(sessions: &BTreeMap<SessionId, Session>) -> Vec<FindItem> {
                 tab,
                 id: t.id,
                 name: t.name.clone(),
-                session_name: name.to_string(),
+                session_name: name.clone(),
             });
         }
     }
     out
 }
 
-/// Indices of the items whose names fuzzy-match `query`, best first. An
-/// empty query matches everything.
+/// Indices of the items whose names fuzzy-match `query`, grouped by home
+/// session. Groups run in order of their best match, and matches within a
+/// group best first. An empty query matches everything.
 pub fn matches(items: &[FindItem], query: &str) -> Vec<usize> {
     let mut scored: Vec<(i32, usize)> = items
         .iter()
@@ -88,7 +97,36 @@ pub fn matches(items: &[FindItem], query: &str) -> Vec<usize> {
         .filter_map(|(i, item)| score(query, &item.name).map(|s| (s, i)))
         .collect();
     scored.sort_by_key(|&(s, i)| (std::cmp::Reverse(s), i));
-    scored.into_iter().map(|(_, i)| i).collect()
+    let mut ranked: Vec<usize> = scored.into_iter().map(|(_, i)| i).collect();
+    let mut groups: Vec<SessionId> = Vec::new();
+    for &i in &ranked {
+        if !groups.contains(&items[i].session) {
+            groups.push(items[i].session);
+        }
+    }
+    ranked.sort_by_key(|&i| groups.iter().position(|&s| s == items[i].session));
+    ranked
+}
+
+/// A list row: a session's heading, or a match by its place in the
+/// matched list.
+enum Row {
+    Heading(usize),
+    Match(usize),
+}
+
+/// The matched list with a heading ahead of each session's run.
+fn rows(items: &[FindItem], matched: &[usize]) -> Vec<Row> {
+    let mut out = Vec::with_capacity(matched.len());
+    let mut group = None;
+    for (m, &idx) in matched.iter().enumerate() {
+        if group != Some(items[idx].session) {
+            group = Some(items[idx].session);
+            out.push(Row::Heading(idx));
+        }
+        out.push(Row::Match(m));
+    }
+    out
 }
 
 /// Case-insensitive subsequence match, scored higher for consecutive hits
@@ -118,6 +156,7 @@ pub fn render(
     buf: &mut Buffer,
     area: Rect,
     sessions: &mut BTreeMap<SessionId, Session>,
+    hosts: &BTreeMap<HostId, Host>,
     state: &FinderState,
     config: &Config,
     colors: &palette::TermColors,
@@ -131,10 +170,12 @@ pub fn render(
     Block::bordered()
         .border_style(Style::default().fg(palette.dim))
         .render(window, buf);
+    let items = items(sessions, hosts);
     render_panes(
         buf,
         window.inner(Margin::new(1, 1)),
         sessions,
+        &items,
         state,
         palette,
     );
@@ -148,11 +189,11 @@ fn render_panes(
     buf: &mut Buffer,
     inner: Rect,
     sessions: &mut BTreeMap<SessionId, Session>,
+    items: &[FindItem],
     state: &FinderState,
     palette: &Palette,
 ) {
-    let items = items(sessions);
-    let matched = matches(&items, &state.query());
+    let matched = matches(items, &state.query());
     let highlight = state.highlight.min(matched.len().saturating_sub(1));
     let dim = Style::default().fg(palette.dim);
     if inner.width > inner.height {
@@ -163,7 +204,7 @@ fn render_panes(
                 width: list_w,
                 ..inner
             },
-            &items,
+            items,
             &matched,
             highlight,
             state,
@@ -183,7 +224,7 @@ fn render_panes(
             width: inner.width - list_w - 1,
             ..inner
         };
-        render_match_preview(buf, preview, sessions, &items, &matched, highlight);
+        render_match_preview(buf, preview, sessions, items, &matched, highlight);
     } else {
         let list_h = inner.height / 2;
         render_list(
@@ -192,7 +233,7 @@ fn render_panes(
                 height: list_h,
                 ..inner
             },
-            &items,
+            items,
             &matched,
             highlight,
             state,
@@ -212,7 +253,7 @@ fn render_panes(
             height: inner.height - list_h - 1,
             ..inner
         };
-        render_match_preview(buf, preview, sessions, &items, &matched, highlight);
+        render_match_preview(buf, preview, sessions, items, &matched, highlight);
     }
 }
 
@@ -250,48 +291,45 @@ fn render_list(
         area.height.min(1),
     );
     state.textarea.render(input, buf);
+    let rows = rows(items, matched);
+    let highlight_row = rows
+        .iter()
+        .position(|r| matches!(r, Row::Match(m) if *m == highlight))
+        .unwrap_or(0);
     // Without scroll state, the visible window slides to keep the highlight
     // on its last row.
     let visible = area.height.saturating_sub(1) as usize;
-    let start = (highlight + 1).saturating_sub(visible);
-    for (row, &idx) in matched.iter().enumerate().skip(start) {
-        let y = area.y + 1 + (row - start) as u16;
+    let start = (highlight_row + 1).saturating_sub(visible);
+    for (i, row) in rows.iter().enumerate().skip(start) {
+        let y = area.y + 1 + (i - start) as u16;
         if y >= area.bottom() {
             break;
         }
-        let item = &items[idx];
-        let selected = row == highlight;
-        let (name_style, session_style) = if selected {
-            let style = Style::default()
-                .fg(palette.accent)
-                .add_modifier(Modifier::REVERSED);
-            (style, style)
-        } else {
-            (Style::default(), Style::default().fg(palette.dim))
+        let (text, style) = match *row {
+            Row::Heading(idx) => (
+                format!(" {}", items[idx].session_name),
+                Style::default()
+                    .fg(palette.muted)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Row::Match(m) if m == highlight => (
+                format!("  {} ", items[matched[m]].name),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::REVERSED),
+            ),
+            Row::Match(m) => (format!("  {} ", items[matched[m]].name), Style::default()),
         };
-        let mut x = area.x;
-        let mut put = |x: &mut u16, ch: char, style: Style| -> bool {
-            if *x >= area.right() {
-                return false;
+        for (j, ch) in text.chars().enumerate() {
+            let x = area.x + j as u16;
+            if x >= area.right() {
+                break;
             }
-            if let Some(dst) = buf.cell_mut(Position::new(*x, y)) {
+            if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
                 dst.set_char(ch);
                 dst.set_style(style);
             }
-            *x += 1;
-            true
-        };
-        for ch in format!(" {} ", item.name).chars() {
-            if !put(&mut x, ch, name_style) {
-                break;
-            }
         }
-        for ch in item.session_name.chars() {
-            if !put(&mut x, ch, session_style) {
-                break;
-            }
-        }
-        put(&mut x, ' ', session_style);
     }
 }
 
@@ -369,6 +407,31 @@ mod tests {
     fn empty_query_matches_everything_in_stable_order() {
         let items = [item("zsh"), item("claude"), item("vim")];
         assert_eq!(matches(&items, ""), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn matches_group_by_session_in_order_of_each_best_match() {
+        let in_session = |name: &str, session| FindItem {
+            session,
+            ..item(name)
+        };
+        let items = [
+            in_session("calc", 0),
+            in_session("claude", 1),
+            in_session("clock", 0),
+            in_session("cl", 1),
+        ];
+        // Best first would be claude, clock, cl, calc.
+        assert_eq!(matches(&items, "cl"), vec![1, 3, 2, 0]);
+        let rows = rows(&items, &matches(&items, "cl"));
+        let shape: Vec<String> = rows
+            .iter()
+            .map(|r| match r {
+                Row::Heading(idx) => format!("h{}", items[*idx].session),
+                Row::Match(m) => format!("m{m}"),
+            })
+            .collect();
+        assert_eq!(shape, ["h1", "m0", "m1", "h0", "m2", "m3"]);
     }
 
     #[test]

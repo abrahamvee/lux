@@ -29,8 +29,6 @@ pub type HostId = usize;
 /// Reconnect attempts before giving up on a lost host.
 const MAX_ATTEMPTS: u32 = 6;
 
-const TAG_WIDTH: usize = 3;
-
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 pub fn next_token() -> u64 {
@@ -120,10 +118,6 @@ impl Host {
             colors: None,
             refusal: None,
         }
-    }
-
-    pub fn tag(&self) -> String {
-        self.alias.chars().take(TAG_WIDTH).collect()
     }
 
     pub fn online(&self) -> bool {
@@ -734,7 +728,6 @@ impl Server {
             id,
             link: host.link.clone(),
             remote: snap.id,
-            tag: host.tag(),
             synced: None,
         };
         let area = self.client_area().unwrap_or(Rect::new(0, 0, 80, 24));

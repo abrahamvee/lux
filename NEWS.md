@@ -8,6 +8,8 @@
   the file alone if the value is invalid.
 - `lux ls` also lists connected hosts' sessions as `name@alias`.
 - The switcher no longer lists CLAUDECOM; prefix+`g` opens it.
+- The switcher groups each connected host's sessions under a heading, and
+  the finder groups tabs under a heading per session.
 
 ## 2026-09-23
 
