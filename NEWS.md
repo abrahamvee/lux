@@ -1,5 +1,10 @@
 # News
 
+## 2026-09-23
+
+- All new-session paths prompt for remote host when a remote session is
+  attached. When creating a session from the CLI, use `name@host`.
+
 ## 2026-09-22
 
 - `:connect <ssh-alias>` adopts another host's lux sessions over ssh, listing

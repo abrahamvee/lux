@@ -2,7 +2,10 @@
 //! mirroring what each host sends.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{BufReader, Read};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -12,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
+use crate::protocol;
 use crate::server::palette::TermColors;
 use crate::server::session::{Session, SessionHost};
 use crate::server::window::{Notice, TabId};
@@ -225,6 +229,20 @@ impl Host {
     }
 }
 
+/// A CLI attach to `name@alias`, which hears `ok` or `err` only once the
+/// host has connected and the session exists.
+pub struct PendingAttach {
+    stream: UnixStream,
+    stdin: OwnedFd,
+    stdout: File,
+    host: HostId,
+    name: Option<String>,
+}
+
+fn usable_alias(alias: &str) -> bool {
+    !alias.is_empty() && !alias.contains(['.', '@']) && !alias.contains(char::is_whitespace)
+}
+
 /// The delay before reconnect `attempt`, counting from 1.
 fn backoff(attempt: u32) -> Duration {
     Duration::from_secs(1 << attempt.saturating_sub(1).min(5))
@@ -254,7 +272,7 @@ impl Server {
     }
 
     pub(super) fn connect(&mut self, conn: ConnId, alias: String) {
-        if alias.contains(['.', '@']) || alias.contains(char::is_whitespace) {
+        if !usable_alias(&alias) {
             self.tell(
                 conn,
                 format!("connect: '{alias}' is not a usable ssh alias"),
@@ -278,14 +296,114 @@ impl Server {
             }
             return;
         }
+        if let Err(err) = self.add_host(&alias) {
+            self.tell(conn, format!("connect {alias}: {err}"));
+        }
+    }
+
+    fn add_host(&mut self, alias: &str) -> Result<HostId, String> {
         let id = self.next_host_id;
+        let mut host = Host::new(alias.to_string());
+        host.start(id, &self.tx, self.instance)?;
         self.next_host_id += 1;
-        let mut host = Host::new(alias.clone());
-        match host.start(id, &self.tx, self.instance) {
-            Ok(()) => {
-                self.hosts.insert(id, host);
+        self.hosts.insert(id, host);
+        Ok(id)
+    }
+
+    /// Attaches a CLI client to `address`'s host, connecting to it first
+    /// when it isn't connected.
+    pub(super) fn attach_remote(
+        &mut self,
+        conn: ConnId,
+        mut stream: UnixStream,
+        address: &str,
+        stdin: OwnedFd,
+        stdout: File,
+    ) {
+        let (name, alias) = split_address(address);
+        let alias = alias.unwrap_or_default();
+        let id = match self.host_for_attach(alias) {
+            Ok(id) => id,
+            Err(err) => {
+                let _ = protocol::write_line(&mut stream, &format!("err connect {alias}: {err}"));
+                return;
             }
-            Err(err) => self.tell(conn, format!("connect {alias}: {err}")),
+        };
+        let name = (!name.is_empty()).then(|| name.to_string());
+        self.pending_attaches.insert(
+            conn,
+            PendingAttach {
+                stream,
+                stdin,
+                stdout,
+                host: id,
+                name,
+            },
+        );
+        if self.hosts[&id].online() {
+            self.resolve_attach(conn);
+        }
+    }
+
+    /// The host named `alias`, with a connection under way unless it is
+    /// already connected or connecting.
+    fn host_for_attach(&mut self, alias: &str) -> Result<HostId, String> {
+        if !usable_alias(alias) {
+            return Err("not a usable ssh alias".into());
+        }
+        let Some(id) = self.host_by_alias(alias) else {
+            return self.add_host(alias);
+        };
+        let host = self.hosts.get_mut(&id).expect("host exists");
+        if matches!(host.state, HostState::Backoff(_) | HostState::Exhausted) {
+            host.attempts = 0;
+            if let Err(err) = host.start(id, &self.tx, self.instance) {
+                self.host_closed(id, err.clone());
+                return Err(err);
+            }
+        }
+        Ok(id)
+    }
+
+    /// Attaches a pending client to its session, or asks the connected
+    /// host to create it.
+    fn resolve_attach(&mut self, conn: ConnId) {
+        let Some(pending) = self.pending_attaches.get(&conn) else {
+            return;
+        };
+        let (host, name) = (pending.host, pending.name.clone());
+        let size = term::fd_size(&pending.stdout);
+        if let Some(sid) = name
+            .as_deref()
+            .and_then(|n| self.remote_session_by_name(host, n))
+        {
+            self.finish_attach(conn, sid);
+            return;
+        }
+        self.request_session(conn, host, name, Rect::new(0, 0, size.width, size.height));
+    }
+
+    fn finish_attach(&mut self, conn: ConnId, sid: SessionId) {
+        if let Some(p) = self.pending_attaches.remove(&conn) {
+            self.install_client(conn, p.stream, sid, p.stdin, p.stdout);
+        }
+    }
+
+    fn fail_attach(&mut self, conn: ConnId, reason: &str) {
+        if let Some(mut p) = self.pending_attaches.remove(&conn) {
+            let _ = protocol::write_line(&mut p.stream, &format!("err {reason}"));
+        }
+    }
+
+    fn fail_attaches(&mut self, host: HostId, reason: &str) {
+        let conns: Vec<ConnId> = self
+            .pending_attaches
+            .iter()
+            .filter(|(_, p)| p.host == host)
+            .map(|(&conn, _)| conn)
+            .collect();
+        for conn in conns {
+            self.fail_attach(conn, reason);
         }
     }
 
@@ -297,6 +415,7 @@ impl Server {
         if let Some(mut host) = self.hosts.remove(&id) {
             host.stop();
         }
+        self.fail_attaches(id, &format!("disconnected from {alias}"));
         let gone: Vec<SessionId> = self
             .sessions
             .iter()
@@ -392,6 +511,9 @@ impl Server {
         };
         host.stop();
         let alias = host.alias.clone();
+        let why = host.refusal.clone().unwrap_or_else(|| reason.clone());
+        self.fail_attaches(id, &format!("connect {alias}: {why}"));
+        let host = self.hosts.get_mut(&id).expect("host exists");
         if !host.established {
             let reason = host.refusal.take().unwrap_or(reason);
             self.hosts.remove(&id);
@@ -447,8 +569,12 @@ impl Server {
                 };
                 let conn = request
                     .and_then(|r| self.hosts.get_mut(&id).and_then(|h| h.waiting.remove(&r)));
-                if let Some(conn) = conn {
-                    self.switch_client(conn, sid);
+                match conn {
+                    Some(conn) if self.pending_attaches.contains_key(&conn) => {
+                        self.finish_attach(conn, sid);
+                    }
+                    Some(conn) => self.switch_client(conn, sid),
+                    None => {}
                 }
             }
             RemoteMsg::NewSessionFailed { request, reason } => {
@@ -457,7 +583,11 @@ impl Server {
                     .get_mut(&id)
                     .and_then(|h| h.waiting.remove(&request));
                 if let Some(conn) = conn {
-                    self.tell(conn, format!("new session: {reason}"));
+                    if self.pending_attaches.contains_key(&conn) {
+                        self.fail_attach(conn, &format!("new session: {reason}"));
+                    } else {
+                        self.tell(conn, format!("new session: {reason}"));
+                    }
                 }
             }
             RemoteMsg::SessionEnded(remote) => {
@@ -579,6 +709,15 @@ impl Server {
             "connected to"
         };
         self.tell_all(format!("{verb} {alias}"));
+        let conns: Vec<ConnId> = self
+            .pending_attaches
+            .iter()
+            .filter(|(_, p)| p.host == id)
+            .map(|(&conn, _)| conn)
+            .collect();
+        for conn in conns {
+            self.resolve_attach(conn);
+        }
     }
 
     /// Mirrors a host's session into `slot`, or a new one. Returns its id.
@@ -688,6 +827,12 @@ impl Server {
             .map_or(Rect::new(0, 0, 80, 24), |s| {
                 Rect::new(0, 0, s.width, s.height)
             });
+        self.request_session(conn, host, name, area);
+    }
+
+    /// Asks a connected host for a session sized to `area`, answered to
+    /// `conn` once it arrives.
+    fn request_session(&mut self, conn: ConnId, host: HostId, name: Option<String>, area: Rect) {
         let request = next_token();
         let h = self.hosts.get_mut(&host).expect("host exists");
         h.waiting.insert(request, conn);
@@ -793,6 +938,7 @@ mod tests {
             tx,
             hosts: BTreeMap::new(),
             next_host_id: 0,
+            pending_attaches: HashMap::new(),
             hub: None,
             pending_hubs: Vec::new(),
             instance: next_token(),
@@ -1053,6 +1199,72 @@ mod tests {
         assert!(pair.remote.adopted());
         pair.remote.hub_gone(HUB_CONN);
         assert!(!pair.remote.adopted());
+    }
+
+    const CLI_CONN: ConnId = 50;
+
+    /// Starts a CLI attach to `address`, returning the client's end of
+    /// its control stream.
+    fn cli_attach(hub: &mut Server, address: &str) -> UnixStream {
+        let (near, far) = UnixStream::pair().unwrap();
+        let null = || File::options().read(true).write(true).open("/dev/null");
+        let (stdin, stdout) = (null().unwrap(), null().unwrap());
+        hub.attach_remote(CLI_CONN, near, address, stdin.into(), stdout);
+        far.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        far
+    }
+
+    fn answer(stream: &mut UnixStream) -> Option<String> {
+        protocol::read_line(stream).ok().flatten()
+    }
+
+    #[test]
+    fn a_cli_attach_waits_for_the_host_then_creates_the_session() {
+        let mut pair = Pair::new();
+        let mut cli = cli_attach(&mut pair.hub, "fresh@devbox");
+        assert_eq!(answer(&mut cli), None);
+        pair.until("the attach", |p| p.hub.clients.contains_key(&CLI_CONN));
+        assert_eq!(answer(&mut cli).as_deref(), Some("ok"));
+        let sid = pair.hub.remote_session_by_name(HOST, "fresh").unwrap();
+        assert_eq!(pair.hub.clients[&CLI_CONN].attached, sid);
+        assert!(pair.remote.sessions.values().any(|s| s.name == "fresh"));
+    }
+
+    #[test]
+    fn a_cli_attach_joins_an_existing_session_on_a_connected_host() {
+        let mut pair = Pair::new();
+        pair.until("the snapshot", |p| p.hub.hosts[&HOST].online());
+        let mut cli = cli_attach(&mut pair.hub, "work@devbox");
+        assert_eq!(answer(&mut cli).as_deref(), Some("ok"));
+        let sid = pair.hub.remote_session_by_name(HOST, "work").unwrap();
+        assert_eq!(pair.hub.clients[&CLI_CONN].attached, sid);
+        assert_eq!(pair.remote.sessions.len(), 1);
+    }
+
+    #[test]
+    fn a_cli_attach_fails_when_the_connect_does() {
+        let mut pair = Pair::new();
+        let mut cli = cli_attach(&mut pair.hub, "work@devbox");
+        pair.hub
+            .host_closed(HOST, "Permission denied (publickey).".into());
+        assert_eq!(
+            answer(&mut cli).as_deref(),
+            Some("err connect devbox: Permission denied (publickey).")
+        );
+        assert!(pair.hub.pending_attaches.is_empty());
+        assert!(!pair.hub.clients.contains_key(&CLI_CONN));
+    }
+
+    #[test]
+    fn a_cli_attach_refuses_an_unusable_alias() {
+        let (mut hub, _events) = server();
+        let mut cli = cli_attach(&mut hub, "work@dev.box");
+        assert_eq!(
+            answer(&mut cli).as_deref(),
+            Some("err connect dev.box: not a usable ssh alias")
+        );
+        assert!(hub.hosts.is_empty());
     }
 
     #[test]

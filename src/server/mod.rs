@@ -135,6 +135,8 @@ struct HostChoice {
     /// `None` is this host.
     hosts: Vec<Option<HostId>>,
     highlight: usize,
+    /// Escape returns to the session rather than the switcher.
+    from_command_line: bool,
 }
 
 pub fn run() -> i32 {
@@ -197,6 +199,7 @@ pub fn run() -> i32 {
         tx,
         hosts: BTreeMap::new(),
         next_host_id: 0,
+        pending_attaches: HashMap::new(),
         hub: None,
         pending_hubs: Vec::new(),
         instance: instance_id(),
@@ -347,6 +350,8 @@ struct Server {
     /// Hosts whose sessions this server adopted.
     hosts: BTreeMap<HostId, Host>,
     next_host_id: HostId,
+    /// CLI attaches to a remote session, held until its host answers.
+    pending_attaches: HashMap<ConnId, host::PendingAttach>,
     /// The hub that adopted this host's sessions, or one mid-handshake.
     hub: Option<serve::Hub>,
     /// Hubs mid-handshake while another holds this host.
@@ -578,6 +583,7 @@ impl Server {
                 }
             }
             ServerEvent::ConnGone(conn) => {
+                self.pending_attaches.remove(&conn);
                 self.detach(conn);
             }
             ServerEvent::Input(conn, bytes) => self.client_input(conn, bytes),
@@ -627,9 +633,12 @@ impl Server {
         }
         let sid = match request {
             Request::New => self.create_session(None, area),
+            Request::Session(name) if name.contains('@') => {
+                self.attach_remote(conn, stream, &name, stdin, stdout_file);
+                return;
+            }
             Request::Session(name) => match self.session_by_name(&name) {
                 Some(sid) => Ok(sid),
-                None if name.contains('@') => Err(AT_IN_NAME.to_string()),
                 None => self.create_session(Some(name), area),
             },
             Request::Recent => match self.recent_session() {
@@ -645,10 +654,23 @@ impl Server {
                 return;
             }
         };
+        self.install_client(conn, stream, sid, stdin, stdout_file);
+    }
 
+    /// Acknowledges the attach and hands the client's terminal to `sid`.
+    fn install_client(
+        &mut self,
+        conn: ConnId,
+        mut stream: UnixStream,
+        sid: SessionId,
+        stdin: OwnedFd,
+        stdout_file: File,
+    ) {
         if protocol::write_line(&mut stream, "ok").is_err() {
             return;
         }
+        let size = term::fd_size(&stdout_file);
+        let area = Rect::new(0, 0, size.width, size.height);
 
         if let Some(&old) = self
             .clients
@@ -972,7 +994,7 @@ impl Server {
                 }
             }
             Effect::OpenFinder => self.open_finder(conn),
-            Effect::NewSession(name) => self.new_session_for(conn, name),
+            Effect::NewSession(name) => self.submit_new_session(conn, name, true),
             Effect::RenameSession(name) => {
                 if name.contains('@') {
                     self.tell(conn, AT_IN_NAME.into());
@@ -1167,32 +1189,7 @@ impl Server {
                 let text = prompt.lines().first().cloned().unwrap_or_default();
                 client.new_session = None;
                 let name = (!text.is_empty()).then_some(text);
-                // An address already names its host.
-                let hosts: Vec<Option<HostId>> = std::iter::once(None)
-                    .chain(
-                        self.hosts
-                            .iter()
-                            .filter(|(_, h)| h.online())
-                            .map(|(&id, _)| Some(id)),
-                    )
-                    .collect();
-                if hosts.len() > 1 && !name.as_deref().is_some_and(|n| n.contains('@')) {
-                    if let Some(client) = self.clients.get_mut(&conn) {
-                        client.host_choice = Some(HostChoice {
-                            name,
-                            hosts,
-                            highlight: 0,
-                        });
-                    }
-                    return;
-                }
-                if name
-                    .as_deref()
-                    .is_some_and(|n| self.session_by_address(n).is_some())
-                {
-                    return;
-                }
-                self.new_session_for(conn, name);
+                self.submit_new_session(conn, name, false);
             }
             _ => {
                 prompt.input(ratatui_textarea::Input::from(*key));
@@ -1200,8 +1197,43 @@ impl Server {
         }
     }
 
+    /// Asks which host to run on while any is online, unless the name is
+    /// already an address; otherwise creates here unless the name is taken.
+    fn submit_new_session(&mut self, conn: ConnId, name: Option<String>, from_command_line: bool) {
+        let hosts: Vec<Option<HostId>> = std::iter::once(None)
+            .chain(
+                self.hosts
+                    .iter()
+                    .filter(|(_, h)| h.online())
+                    .map(|(&id, _)| Some(id)),
+            )
+            .collect();
+        if hosts.len() > 1 && !name.as_deref().is_some_and(|n| n.contains('@')) {
+            // The choice renders over the switcher.
+            if from_command_line {
+                self.open_switcher(conn);
+            }
+            if let Some(client) = self.clients.get_mut(&conn) {
+                client.host_choice = Some(HostChoice {
+                    name,
+                    hosts,
+                    highlight: 0,
+                    from_command_line,
+                });
+            }
+            return;
+        }
+        if name
+            .as_deref()
+            .is_some_and(|n| self.session_by_address(n).is_some())
+        {
+            return;
+        }
+        self.new_session_for(conn, name);
+    }
+
     /// Enter creates the session on the highlighted host; Escape returns
-    /// to the switcher.
+    /// to where the choice was opened from.
     fn host_choice_input(&mut self, conn: ConnId, key: &KeyEvent) {
         let Some(choice) = self
             .clients
@@ -1212,6 +1244,7 @@ impl Server {
         };
         let count = choice.hosts.len();
         match key.code {
+            CtKeyCode::Esc if choice.from_command_line => self.switcher_cancel(conn),
             CtKeyCode::Esc => {
                 if let Some(client) = self.clients.get_mut(&conn) {
                     client.host_choice = None;
@@ -1231,6 +1264,9 @@ impl Server {
                 else {
                     return;
                 };
+                if choice.from_command_line {
+                    self.switcher_cancel(conn);
+                }
                 match choice.hosts[choice.highlight] {
                     None => {
                         if choice
