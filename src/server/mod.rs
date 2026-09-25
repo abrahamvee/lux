@@ -1864,6 +1864,43 @@ impl Server {
             state.capture = None;
             state.pending_prefix = false;
         }
+        // Handle mouse events
+        if let DecodedInput::Mouse(mouse) = event {
+            if mouse.kind == CtMouseKind::Down(CtMouseButton::Left) {
+                let is_double = grid::is_double_click(&mut state, Position::new(mouse.column, mouse.row));
+                if let Some(idx) = grid::item_at_pos(
+                    Rect::new(0, 0, self.clients.get(&conn).map_or(0, |c| term::fd_size(&c.raw_out).width),
+                              self.clients.get(&conn).map_or(0, |c| term::fd_size(&c.raw_out).height)),
+                    items.len(),
+                    state.scroll,
+                    Position::new(mouse.column, mouse.row)
+                ) {
+                    let item = items.get(idx).copied();
+                    if let Some(item) = item {
+                        if is_double {
+                            // Double-click: enter capture mode
+                            if let Some(tab) = self
+                                .sessions
+                                .get(&item.session)
+                                .and_then(|s| s.tab_at(item.window, item.tab))
+                            {
+                                state.capture = Some(tab.id);
+                                state.pending_prefix = false;
+                            }
+                        } else {
+                            // Single click: go to the window
+                            if let Some(client) = self.clients.get_mut(&conn) {
+                                client.grid = None;
+                            }
+                            self.attach_to_tab(conn, item.session, item.window, item.tab);
+                            return;
+                        }
+                    }
+                }
+            }
+            self.store_grid_state(conn, state);
+            return;
+        }
         let DecodedInput::Key(key) = event else {
             self.store_grid_state(conn, state);
             return;
@@ -1973,7 +2010,15 @@ impl Server {
                 session.key_to_tab(item.window, item.tab, *key);
             }
             DecodedInput::Paste(text) => session.paste_to_tab(item.window, item.tab, text),
-            DecodedInput::Mouse(_) | DecodedInput::Color(..) => {}
+            DecodedInput::Mouse(mouse) => {
+                // Double-click to exit capture mode
+                if mouse.kind == CtMouseKind::Down(CtMouseButton::Left) {
+                    if grid::is_double_click(state, Position::new(mouse.column, mouse.row)) {
+                        state.capture = None;
+                    }
+                }
+            }
+            DecodedInput::Color(..) => {}
         }
         None
     }

@@ -1,7 +1,7 @@
 //! The CLAUDECOM grid: tiles every agent tab across all sessions.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -19,16 +19,23 @@ use crate::server::{SessionId, clear_region};
 const MIN_TILE_COLS: u16 = 60;
 const TILE_ROWS: u16 = 24;
 
+// Double-click window: 500ms
+const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(500);
+
 /// A client's view of the grid.
 #[derive(Clone, Copy, Default)]
 pub struct GridState {
     pub highlight: usize,
-    scroll: usize,
+    pub scroll: usize,
     /// The tab receiving key presses instead of grid navigation.
     pub capture: Option<TabId>,
     /// A prefix key awaiting its follow-up. In capture mode the prefix
     /// never reaches the tab.
     pub pending_prefix: bool,
+    /// Last click time for double-click detection.
+    last_click_time: Option<Instant>,
+    /// Last click position for double-click detection.
+    last_click_pos: Option<(u16, u16)>,
 }
 
 /// An agent tab, addressed by session, window, and position in the
@@ -119,6 +126,35 @@ pub fn navigate(state: &mut GridState, area: Rect, count: usize, dir: Dir) {
         Dir::Down => (i + l.cols < count).then(|| i + l.cols),
     };
     state.highlight = target.unwrap_or(i);
+}
+
+/// Find the grid item at the given screen position, or None if no tile is clicked.
+pub fn item_at_pos(area: Rect, count: usize, scroll: usize, pos: Position) -> Option<usize> {
+    let l = layout(area, count)?;
+    if pos.x < area.x || pos.y < area.y || pos.x >= area.right() || pos.y >= area.bottom() {
+        return None;
+    }
+    let x = pos.x - area.x;
+    let y = pos.y - area.y;
+    let col = (x as usize) / (l.tile_w as usize + 1);
+    let row = (y as usize) / (l.tile_h as usize);
+    if col >= l.cols || row >= l.visible {
+        return None;
+    }
+    let i = (scroll + row) * l.cols + col;
+    (i < count).then_some(i)
+}
+
+/// Check if this is a double-click: same position, within double-click window.
+pub fn is_double_click(state: &mut GridState, pos: Position) -> bool {
+    let now = Instant::now();
+    let is_double = state
+        .last_click_time
+        .is_some_and(|t| now.duration_since(t) < DOUBLE_CLICK_TIME)
+        && state.last_click_pos == Some((pos.x, pos.y));
+    state.last_click_time = Some(now);
+    state.last_click_pos = Some((pos.x, pos.y));
+    is_double
 }
 
 fn ensure_visible(state: &mut GridState, l: &Layout) {
@@ -507,5 +543,44 @@ mod tests {
             );
             assert_eq!(buf.cell(Position::new(4, 2)).unwrap().symbol(), " ");
         }
+    }
+
+    #[test]
+    fn clicking_finds_the_right_grid_item() {
+        let area = Rect::new(0, 0, 240, 70);
+        // 4 columns, 6 items: 2 rows
+        assert_eq!(item_at_pos(area, 6, 0, Position::new(30, 12)), Some(0));
+        assert_eq!(item_at_pos(area, 6, 0, Position::new(90, 12)), Some(1));
+        assert_eq!(item_at_pos(area, 6, 0, Position::new(150, 12)), Some(2));
+        assert_eq!(item_at_pos(area, 6, 0, Position::new(210, 12)), Some(3));
+        assert_eq!(item_at_pos(area, 6, 0, Position::new(30, 36)), Some(4));
+        assert_eq!(item_at_pos(area, 6, 0, Position::new(90, 36)), Some(5));
+        assert_eq!(item_at_pos(area, 6, 0, Position::new(150, 36)), None);
+    }
+
+    #[test]
+    fn click_respects_scroll_offset() {
+        let area = Rect::new(0, 0, 240, 70);
+        // With 20 items in a 4-column layout: 5 rows, 2 visible
+        // Scrolled to show rows 2-3
+        assert_eq!(item_at_pos(area, 20, 2, Position::new(30, 12)), Some(8));
+        assert_eq!(item_at_pos(area, 20, 2, Position::new(90, 12)), Some(9));
+    }
+
+    #[test]
+    fn click_outside_grid_returns_none() {
+        let area = Rect::new(10, 5, 100, 50);
+        assert_eq!(item_at_pos(area, 10, 0, Position::new(5, 5)), None);
+        assert_eq!(item_at_pos(area, 10, 0, Position::new(110, 5)), None);
+        assert_eq!(item_at_pos(area, 10, 0, Position::new(10, 55)), None);
+    }
+
+    #[test]
+    fn double_click_detection_works() {
+        let mut state = GridState::default();
+        let pos = Position::new(30, 12);
+        assert!(!is_double_click(&mut state, pos), "first click is not double");
+        assert!(is_double_click(&mut state, pos), "second click at same pos is double");
+        assert!(!is_double_click(&mut state, Position::new(31, 12)), "different pos breaks streak");
     }
 }
